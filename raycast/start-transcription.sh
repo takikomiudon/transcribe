@@ -2,7 +2,7 @@
 
 # Required parameters:
 # @raycast.schemaVersion 1
-# @raycast.title 文字起こしを開始
+# @raycast.title transcribe
 # @raycast.mode silent
 
 # Optional parameters:

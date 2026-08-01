@@ -2,7 +2,7 @@
 
 # Required parameters:
 # @raycast.schemaVersion 1
-# @raycast.title 日本語訳付き文字起こしを開始
+# @raycast.title transcribe-ja
 # @raycast.mode silent
 
 # Optional parameters:

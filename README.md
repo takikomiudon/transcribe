@@ -54,8 +54,8 @@ uv run transcribe.py --device 0 --translate-ja
 
 Raycastの「Settings → Extensions」で `+` を押し、「Add Script Directory」からこのリポジトリの `raycast` ディレクトリを追加します。次の2コマンドが使えるようになります。
 
-- `文字起こしを開始`
-- `日本語訳付き文字起こしを開始`
+- `transcribe`
+- `transcribe-ja`
 
 初回起動時にmacOSから求められたら、RaycastによるTerminalの操作を許可してください。各コマンドにはRaycastの設定から任意のホットキーを割り当てられます。
 
