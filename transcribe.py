@@ -19,9 +19,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from array import array
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from math import isqrt
 from pathlib import Path
@@ -29,7 +31,9 @@ from typing import Any
 
 
 MODEL = "gpt-live-transcribe"
+TRANSLATION_MODEL = "gpt-5.6-luna"
 WEBSOCKET_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
+RESPONSES_URL = "https://api.openai.com/v1/responses"
 SAMPLE_RATE = 24_000
 CHUNK_MILLISECONDS = 10
 CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MILLISECONDS // 1_000
@@ -38,6 +42,7 @@ PRE_ROLL_MILLISECONDS = 500
 SILENCE_COMMIT_MILLISECONDS = 800
 MAX_TURN_MILLISECONDS = 30_000
 FINAL_WAIT_SECONDS = 5
+TRANSLATION_TIMEOUT_SECONDS = 20
 
 
 class TranscriptionError(Exception):
@@ -50,6 +55,10 @@ class CaptureError(TranscriptionError):
 
 class RealtimeAPIError(TranscriptionError):
     """OpenAI returned an error event."""
+
+
+class TranslationError(TranscriptionError):
+    """OpenAI couldn't translate a completed transcript."""
 
 
 def pcm16_rms(chunk: bytes) -> int:
@@ -119,6 +128,7 @@ class TranscriptReducer:
         self.committed_item_ids: set[str] = set()
         self.written: set[str] = set()
         self.next_to_write = 0
+        self.ready: deque[str] = deque()
 
     def _remember(self, item_id: str) -> None:
         if item_id not in self.partials:
@@ -134,6 +144,7 @@ class TranscriptReducer:
                 text = self.completed[item_id].strip()
                 if text:
                     self.write_final(text)
+                    self.ready.append(text)
                 self.written.add(item_id)
             self.next_to_write += 1
 
@@ -172,6 +183,11 @@ class TranscriptReducer:
     def has_pending(self) -> bool:
         return any(item_id not in self.completed for item_id in self.order)
 
+    def take_ready(self) -> list[str]:
+        ready = list(self.ready)
+        self.ready.clear()
+        return ready
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -190,6 +206,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=SILENCE_RMS_THRESHOLD,
         metavar="RMS",
         help=f"無音判定のRMS値（既定: {SILENCE_RMS_THRESHOLD}）",
+    )
+    parser.add_argument(
+        "--translate-ja",
+        action="store_true",
+        help="確定した英語・韓国語を日本語へ翻訳",
     )
     return parser
 
@@ -279,7 +300,7 @@ def session_update() -> dict[str, Any]:
                     "format": {"type": "audio/pcm", "rate": SAMPLE_RATE},
                     "transcription": {
                         "model": MODEL,
-                        "languages": ["ja", "en"],
+                        "languages": ["ja", "en", "ko"],
                         "delay": "low",
                     },
                     "turn_detection": None,
@@ -301,13 +322,74 @@ def transcript_path(now: datetime | None = None) -> Path:
     return candidate
 
 
-def write_header(file: Any, device: int) -> None:
+def translation_payload(text: str) -> dict[str, Any]:
+    return {
+        "model": TRANSLATION_MODEL,
+        "reasoning": {"effort": "none"},
+        "instructions": (
+            "Translate only English and Korean portions into natural Japanese. "
+            "Leave existing Japanese unchanged. Preserve names, numbers, facts, "
+            "and formatting. Output only the resulting Japanese text."
+        ),
+        "input": text,
+        "max_output_tokens": 1_024,
+        "store": False,
+    }
+
+
+def response_output_text(response: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for item in response.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []):
+            if content.get("type") == "output_text":
+                parts.append(str(content.get("text", "")))
+    text = "".join(parts).strip()
+    if not text:
+        raise TranslationError("日本語訳が空でした。")
+    return text
+
+
+def translate_to_japanese(text: str, api_key: str) -> str:
+    request = urllib.request.Request(
+        RESPONSES_URL,
+        data=json.dumps(translation_payload(text)).encode(),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            request, timeout=TRANSLATION_TIMEOUT_SECONDS
+        ) as response:
+            payload = json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        try:
+            detail = json.loads(error.read()).get("error", {}).get("message")
+        except (json.JSONDecodeError, AttributeError):
+            detail = None
+        raise TranslationError(str(detail or f"HTTP {error.code}")) from error
+    except (OSError, TimeoutError, urllib.error.URLError) as error:
+        raise TranslationError(f"日本語翻訳との通信に失敗しました: {error}") from error
+    except json.JSONDecodeError as error:
+        raise TranslationError("日本語翻訳から不正なJSONを受信しました。") from error
+    return response_output_text(payload)
+
+
+def write_header(file: Any, device: int, translate_to_ja: bool = False) -> None:
     started = datetime.now().astimezone().isoformat(timespec="seconds")
+    translation = (
+        f"- Translation model: `{TRANSLATION_MODEL}`\n" if translate_to_ja else ""
+    )
     file.write(
         "# Transcript\n\n"
         f"- Started: {started}\n"
         f"- Device: {device}\n"
-        f"- Model: `{MODEL}`\n\n"
+        f"- Model: `{MODEL}`\n"
+        f"{translation}\n"
         "## Transcript\n\n"
     )
     file.flush()
@@ -352,6 +434,7 @@ async def receive_events(
     websocket: Any,
     reducer: TranscriptReducer,
     progress_changed: asyncio.Event,
+    finalize_text: Callable[[str], Awaitable[None]] | None = None,
 ) -> None:
     async for raw_message in websocket:
         try:
@@ -365,6 +448,9 @@ async def receive_events(
             raise RealtimeAPIError(str(message))
 
         delta, completed = reducer.handle(event)
+        for text in reducer.take_ready():
+            if finalize_text is not None:
+                await finalize_text(text)
         if delta:
             print(delta, end="", flush=True)
         if completed:
@@ -409,6 +495,7 @@ async def run_transcription(
     api_key: str,
     ffmpeg: str,
     silence_rms_threshold: int = SILENCE_RMS_THRESHOLD,
+    translate_to_ja: bool = False,
 ) -> Path:
     try:
         from websockets.asyncio.client import connect
@@ -438,19 +525,38 @@ async def run_transcription(
 
             output_path = transcript_path()
             with output_path.open("x", encoding="utf-8") as transcript:
-                write_header(transcript, device)
+                write_header(transcript, device, translate_to_ja)
                 print(f"保存先: {output_path}")
 
                 def write_final(text: str) -> None:
                     transcript.write(text + "\n\n")
                     transcript.flush()
 
-                reducer = TranscriptReducer(write_final)
+                async def finalize_text(text: str) -> None:
+                    write_final(text)
+                    translated = await asyncio.to_thread(
+                        translate_to_japanese, text, api_key
+                    )
+                    if translated == text:
+                        return
+                    quote = translated.replace("\n", "\n> ")
+                    transcript.write(f"> **日本語訳:** {quote}\n\n")
+                    transcript.flush()
+                    print(f"[日本語訳] {translated}", flush=True)
+
+                reducer = TranscriptReducer(
+                    (lambda _: None) if translate_to_ja else write_final
+                )
                 sender = asyncio.create_task(
                     stream_audio(websocket, process, stop_event, turn_detector)
                 )
                 receiver = asyncio.create_task(
-                    receive_events(websocket, reducer, progress_changed)
+                    receive_events(
+                        websocket,
+                        reducer,
+                        progress_changed,
+                        finalize_text if translate_to_ja else None,
+                    )
                 )
                 stopper = asyncio.create_task(stop_event.wait())
                 tasks.extend([sender, receiver, stopper])
@@ -524,6 +630,7 @@ def main(argv: list[str] | None = None) -> int:
                 api_key,
                 ffmpeg,
                 args.silence_threshold,
+                args.translate_ja,
             )
         )
     except TranscriptionError as error:

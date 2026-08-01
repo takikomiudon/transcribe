@@ -22,8 +22,39 @@ def test_model_configuration() -> None:
     assert session["audio"]["input"]["transcription"]["model"] == (
         "gpt-live-transcribe"
     )
+    assert session["audio"]["input"]["transcription"]["languages"] == [
+        "ja",
+        "en",
+        "ko",
+    ]
     assert session["audio"]["input"]["turn_detection"] is None
     assert transcribe.CHUNK_MILLISECONDS == 10
+
+
+def test_translation_configuration_and_output() -> None:
+    payload = transcribe.translation_payload("Hello. 안녕하세요.")
+    assert payload["model"] == "gpt-5.6-luna"
+    assert payload["reasoning"] == {"effort": "none"}
+    assert payload["store"] is False
+    assert transcribe.response_output_text(
+        {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "こんにちは。"}
+                    ],
+                }
+            ]
+        }
+    ) == "こんにちは。"
+
+
+def test_translation_flag() -> None:
+    args = transcribe.build_parser().parse_args(
+        ["--device", "0", "--translate-ja"]
+    )
+    assert args.translate_ja
 
 
 def test_local_turn_detection() -> None:
@@ -141,6 +172,7 @@ def test_event_order_and_deduplication() -> None:
     )
     assert reducer.partials["a"] == "Hello world"
     assert written == ["First.", "Second."]
+    assert reducer.take_ready() == ["First.", "Second."]
     assert reducer.committed_item_ids == {"a", "b"}
 
     reducer.handle(
@@ -236,6 +268,8 @@ async def test_websocket_error_preserves_completed_output() -> None:
 
 def main() -> None:
     test_model_configuration()
+    test_translation_configuration_and_output()
+    test_translation_flag()
     test_local_turn_detection()
     asyncio.run(test_idle_silence_is_not_uploaded())
     test_event_order_and_deduplication()
