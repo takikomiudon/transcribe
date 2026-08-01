@@ -20,6 +20,7 @@ import signal
 import subprocess
 import sys
 from array import array
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime
 from math import isqrt
@@ -33,6 +34,7 @@ SAMPLE_RATE = 24_000
 CHUNK_MILLISECONDS = 10
 CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MILLISECONDS // 1_000
 SILENCE_RMS_THRESHOLD = 500
+PRE_ROLL_MILLISECONDS = 500
 SILENCE_COMMIT_MILLISECONDS = 800
 MAX_TURN_MILLISECONDS = 30_000
 FINAL_WAIT_SECONDS = 5
@@ -59,7 +61,7 @@ def pcm16_rms(chunk: bytes) -> int:
 
 
 class LocalTurnDetector:
-    """Commit after local silence or a maximum turn duration."""
+    """Gate uploads until speech, retaining a short local pre-roll."""
 
     def __init__(self, silence_rms_threshold: int = SILENCE_RMS_THRESHOLD) -> None:
         self.silence_rms_threshold = silence_rms_threshold
@@ -67,28 +69,43 @@ class LocalTurnDetector:
         self.silent_milliseconds = 0
         self.heard_speech = False
         self.commits_sent = 0
-
-    def observe(self, chunk: bytes) -> bool:
-        self.buffered_milliseconds += CHUNK_MILLISECONDS
-        if pcm16_rms(chunk) >= self.silence_rms_threshold:
-            self.heard_speech = True
-            self.silent_milliseconds = 0
-        elif self.heard_speech:
-            self.silent_milliseconds += CHUNK_MILLISECONDS
-
-        return self.buffered_milliseconds >= MAX_TURN_MILLISECONDS or (
-            self.heard_speech
-            and self.silent_milliseconds >= SILENCE_COMMIT_MILLISECONDS
+        self.pre_roll: deque[bytes] = deque(
+            maxlen=PRE_ROLL_MILLISECONDS // CHUNK_MILLISECONDS
         )
+
+    def observe(self, chunk: bytes) -> tuple[list[bytes], bool]:
+        is_speech = pcm16_rms(chunk) >= self.silence_rms_threshold
+        if not self.heard_speech:
+            self.pre_roll.append(chunk)
+            if not is_speech:
+                return [], False
+            self.heard_speech = True
+            chunks = list(self.pre_roll)
+            self.pre_roll.clear()
+            self.buffered_milliseconds = len(chunks) * CHUNK_MILLISECONDS
+            self.silent_milliseconds = 0
+        else:
+            chunks = [chunk]
+            self.buffered_milliseconds += CHUNK_MILLISECONDS
+            if is_speech:
+                self.silent_milliseconds = 0
+            else:
+                self.silent_milliseconds += CHUNK_MILLISECONDS
+
+        should_commit = self.buffered_milliseconds >= MAX_TURN_MILLISECONDS or (
+            self.silent_milliseconds >= SILENCE_COMMIT_MILLISECONDS
+        )
+        return chunks, should_commit
 
     def mark_committed(self) -> None:
         self.commits_sent += 1
         self.buffered_milliseconds = 0
         self.silent_milliseconds = 0
         self.heard_speech = False
+        self.pre_roll.clear()
 
     def has_buffered_audio(self) -> bool:
-        return self.buffered_milliseconds > 0
+        return self.heard_speech and self.buffered_milliseconds > 0
 
 
 class TranscriptReducer:
@@ -316,15 +333,17 @@ async def stream_audio(
             raise CaptureError(detail or "音声入力が終了しました。")
         if stop_event.is_set():
             return
-        await websocket.send(
-            json.dumps(
-                {
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(chunk).decode("ascii"),
-                }
+        chunks, should_commit = turn_detector.observe(chunk)
+        for upload_chunk in chunks:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(upload_chunk).decode("ascii"),
+                    }
+                )
             )
-        )
-        if turn_detector.observe(chunk):
+        if should_commit:
             await websocket.send(json.dumps({"type": "input_audio_buffer.commit"}))
             turn_detector.mark_committed()
 

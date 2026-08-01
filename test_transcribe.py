@@ -33,22 +33,74 @@ def test_local_turn_detection() -> None:
     silence = bytes(transcribe.CHUNK_BYTES)
     detector = transcribe.LocalTurnDetector()
 
-    assert not detector.observe(loud)
+    pre_roll_chunks = (
+        transcribe.PRE_ROLL_MILLISECONDS // transcribe.CHUNK_MILLISECONDS
+    )
+    for _ in range(pre_roll_chunks + 10):
+        assert detector.observe(silence) == ([], False)
+    assert not detector.has_buffered_audio()
+
+    chunks, should_commit = detector.observe(loud)
+    assert len(chunks) == pre_roll_chunks
+    assert chunks[-1] == loud
+    assert not should_commit
     silence_chunks = (
         transcribe.SILENCE_COMMIT_MILLISECONDS // transcribe.CHUNK_MILLISECONDS
     )
     for _ in range(silence_chunks - 1):
-        assert not detector.observe(silence)
-    assert detector.observe(silence)
+        assert detector.observe(silence) == ([silence], False)
+    assert detector.observe(silence) == ([silence], True)
 
     detector.mark_committed()
     assert detector.commits_sent == 1
     assert not detector.has_buffered_audio()
 
     max_chunks = transcribe.MAX_TURN_MILLISECONDS // transcribe.CHUNK_MILLISECONDS
-    for _ in range(max_chunks - 1):
-        assert not detector.observe(loud)
-    assert detector.observe(loud)
+    assert detector.observe(loud) == ([loud], False)
+    for _ in range(max_chunks - 2):
+        assert detector.observe(loud) == ([loud], False)
+    assert detector.observe(loud) == ([loud], True)
+
+
+async def test_idle_silence_is_not_uploaded() -> None:
+    class SilenceStdout:
+        def __init__(self) -> None:
+            self.remaining = 100
+
+        async def readexactly(self, expected: int) -> bytes:
+            if self.remaining:
+                self.remaining -= 1
+                return bytes(expected)
+            raise asyncio.IncompleteReadError(partial=b"", expected=expected)
+
+    class ErrorReader:
+        async def read(self, _: int = -1) -> bytes:
+            return b"capture ended"
+
+    class FakeProcess:
+        stdout = SilenceStdout()
+        stderr = ErrorReader()
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def send(self, message: str) -> None:
+            self.messages.append(message)
+
+    websocket = FakeWebSocket()
+    try:
+        await transcribe.stream_audio(
+            websocket,
+            FakeProcess(),  # type: ignore[arg-type]
+            asyncio.Event(),
+            transcribe.LocalTurnDetector(),
+        )
+    except transcribe.CaptureError:
+        pass
+    else:
+        raise AssertionError("CaptureError was not raised")
+    assert websocket.messages == []
 
 
 def test_event_order_and_deduplication() -> None:
@@ -185,6 +237,7 @@ async def test_websocket_error_preserves_completed_output() -> None:
 def main() -> None:
     test_model_configuration()
     test_local_turn_detection()
+    asyncio.run(test_idle_silence_is_not_uploaded())
     test_event_order_and_deduplication()
     test_missing_key_stops_before_capture()
     asyncio.run(test_capture_eof_and_process_cleanup())
