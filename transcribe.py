@@ -26,7 +26,7 @@ from typing import Any
 
 
 MODEL = "gpt-live-transcribe"
-WEBSOCKET_URL = f"wss://api.openai.com/v1/realtime?model={MODEL}"
+WEBSOCKET_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1"
 SAMPLE_RATE = 24_000
 CHUNK_MILLISECONDS = 100
 CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MILLISECONDS // 1_000

@@ -12,6 +12,18 @@ from unittest.mock import patch
 import transcribe
 
 
+def test_model_configuration() -> None:
+    assert (
+        transcribe.WEBSOCKET_URL
+        == "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1"
+    )
+    session = transcribe.session_update()["session"]
+    assert session["type"] == "transcription"
+    assert session["audio"]["input"]["transcription"]["model"] == (
+        "gpt-live-transcribe"
+    )
+
+
 def test_event_order_and_deduplication() -> None:
     written: list[str] = []
     reducer = transcribe.TranscriptReducer(written.append)
@@ -140,6 +152,7 @@ async def test_websocket_error_preserves_completed_output() -> None:
 
 
 def main() -> None:
+    test_model_configuration()
     test_event_order_and_deduplication()
     test_missing_key_stops_before_capture()
     asyncio.run(test_capture_eof_and_process_cleanup())
