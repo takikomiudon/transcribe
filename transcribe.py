@@ -19,17 +19,22 @@ import shutil
 import signal
 import subprocess
 import sys
+from array import array
 from collections.abc import Callable
 from datetime import datetime
+from math import isqrt
 from pathlib import Path
 from typing import Any
 
 
 MODEL = "gpt-live-transcribe"
-WEBSOCKET_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1"
+WEBSOCKET_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
 SAMPLE_RATE = 24_000
-CHUNK_MILLISECONDS = 100
+CHUNK_MILLISECONDS = 10
 CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MILLISECONDS // 1_000
+SILENCE_RMS_THRESHOLD = 500
+SILENCE_COMMIT_MILLISECONDS = 800
+MAX_TURN_MILLISECONDS = 30_000
 FINAL_WAIT_SECONDS = 5
 
 
@@ -45,17 +50,58 @@ class RealtimeAPIError(TranscriptionError):
     """OpenAI returned an error event."""
 
 
+def pcm16_rms(chunk: bytes) -> int:
+    samples = array("h")
+    samples.frombytes(chunk)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return isqrt(sum(sample * sample for sample in samples) // len(samples))
+
+
+class LocalTurnDetector:
+    """Commit after local silence or a maximum turn duration."""
+
+    def __init__(self, silence_rms_threshold: int = SILENCE_RMS_THRESHOLD) -> None:
+        self.silence_rms_threshold = silence_rms_threshold
+        self.buffered_milliseconds = 0
+        self.silent_milliseconds = 0
+        self.heard_speech = False
+        self.commits_sent = 0
+
+    def observe(self, chunk: bytes) -> bool:
+        self.buffered_milliseconds += CHUNK_MILLISECONDS
+        if pcm16_rms(chunk) >= self.silence_rms_threshold:
+            self.heard_speech = True
+            self.silent_milliseconds = 0
+        elif self.heard_speech:
+            self.silent_milliseconds += CHUNK_MILLISECONDS
+
+        return self.buffered_milliseconds >= MAX_TURN_MILLISECONDS or (
+            self.heard_speech
+            and self.silent_milliseconds >= SILENCE_COMMIT_MILLISECONDS
+        )
+
+    def mark_committed(self) -> None:
+        self.commits_sent += 1
+        self.buffered_milliseconds = 0
+        self.silent_milliseconds = 0
+        self.heard_speech = False
+
+    def has_buffered_audio(self) -> bool:
+        return self.buffered_milliseconds > 0
+
+
 class TranscriptReducer:
-    """Order asynchronous completion events by their speech-start order."""
+    """Order asynchronous completion events by their commit order."""
 
     def __init__(self, write_final: Callable[[str], None]) -> None:
         self.write_final = write_final
         self.order: list[str] = []
         self.partials: dict[str, str] = {}
         self.completed: dict[str, str] = {}
+        self.committed_item_ids: set[str] = set()
         self.written: set[str] = set()
         self.next_to_write = 0
-        self.active_item_id: str | None = None
 
     def _remember(self, item_id: str) -> None:
         if item_id not in self.partials:
@@ -79,13 +125,9 @@ class TranscriptReducer:
         event_type = event.get("type")
         item_id = event.get("item_id")
 
-        if event_type == "input_audio_buffer.speech_started" and item_id:
+        if event_type == "input_audio_buffer.committed" and item_id:
             self._remember(item_id)
-            self.active_item_id = item_id
-        elif event_type == "input_audio_buffer.speech_stopped" and item_id:
-            self._remember(item_id)
-            if self.active_item_id == item_id:
-                self.active_item_id = None
+            self.committed_item_ids.add(item_id)
         elif (
             event_type == "conversation.item.input_audio_transcription.delta"
             and item_id
@@ -106,8 +148,6 @@ class TranscriptReducer:
                     str(transcript) if transcript is not None else self.partials[item_id]
                 )
                 self._flush_ready()
-            if self.active_item_id == item_id:
-                self.active_item_id = None
             return "", is_new
 
         return "", False
@@ -126,6 +166,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mode.add_argument(
         "--device", type=non_negative_integer, metavar="INDEX", help="音声入力番号"
+    )
+    parser.add_argument(
+        "--silence-threshold",
+        type=non_negative_integer,
+        default=SILENCE_RMS_THRESHOLD,
+        metavar="RMS",
+        help=f"無音判定のRMS値（既定: {SILENCE_RMS_THRESHOLD}）",
     )
     return parser
 
@@ -218,7 +265,7 @@ def session_update() -> dict[str, Any]:
                         "languages": ["ja", "en"],
                         "delay": "low",
                     },
-                    "turn_detection": {"type": "server_vad"},
+                    "turn_detection": None,
                 }
             },
         },
@@ -253,11 +300,13 @@ async def stream_audio(
     websocket: Any,
     process: asyncio.subprocess.Process,
     stop_event: asyncio.Event,
+    turn_detector: LocalTurnDetector,
 ) -> None:
     assert process.stdout is not None
     while not stop_event.is_set():
-        chunk = await process.stdout.read(CHUNK_BYTES)
-        if not chunk:
+        try:
+            chunk = await process.stdout.readexactly(CHUNK_BYTES)
+        except asyncio.IncompleteReadError:
             if stop_event.is_set():
                 return
             stderr = b""
@@ -275,12 +324,15 @@ async def stream_audio(
                 }
             )
         )
+        if turn_detector.observe(chunk):
+            await websocket.send(json.dumps({"type": "input_audio_buffer.commit"}))
+            turn_detector.mark_committed()
 
 
 async def receive_events(
     websocket: Any,
     reducer: TranscriptReducer,
-    completion_changed: asyncio.Event,
+    progress_changed: asyncio.Event,
 ) -> None:
     async for raw_message in websocket:
         try:
@@ -298,19 +350,28 @@ async def receive_events(
             print(delta, end="", flush=True)
         if completed:
             print(flush=True)
-            completion_changed.set()
+        if completed or event.get("type") == "input_audio_buffer.committed":
+            progress_changed.set()
 
     raise TranscriptionError("Realtime APIとの接続が終了しました。")
 
 
-async def wait_for_pending(
-    reducer: TranscriptReducer, completion_changed: asyncio.Event
+async def wait_for_committed_transcripts(
+    reducer: TranscriptReducer,
+    progress_changed: asyncio.Event,
+    expected_commits: int,
 ) -> None:
+    while len(reducer.committed_item_ids) < expected_commits:
+        progress_changed.clear()
+        if len(reducer.committed_item_ids) >= expected_commits:
+            break
+        await progress_changed.wait()
+
     while reducer.has_pending():
-        completion_changed.clear()
+        progress_changed.clear()
         if not reducer.has_pending():
             return
-        await completion_changed.wait()
+        await progress_changed.wait()
 
 
 async def stop_process(process: asyncio.subprocess.Process | None) -> None:
@@ -324,14 +385,20 @@ async def stop_process(process: asyncio.subprocess.Process | None) -> None:
         await process.wait()
 
 
-async def run_transcription(device: int, api_key: str, ffmpeg: str) -> Path:
+async def run_transcription(
+    device: int,
+    api_key: str,
+    ffmpeg: str,
+    silence_rms_threshold: int = SILENCE_RMS_THRESHOLD,
+) -> Path:
     try:
         from websockets.asyncio.client import connect
     except ImportError as error:
         raise TranscriptionError("`uv run transcribe.py` で起動してください。") from error
 
     stop_event = asyncio.Event()
-    completion_changed = asyncio.Event()
+    progress_changed = asyncio.Event()
+    turn_detector = LocalTurnDetector(silence_rms_threshold)
     loop = asyncio.get_running_loop()
     loop.add_signal_handler(signal.SIGINT, stop_event.set)
     process: asyncio.subprocess.Process | None = None
@@ -361,10 +428,10 @@ async def run_transcription(device: int, api_key: str, ffmpeg: str) -> Path:
 
                 reducer = TranscriptReducer(write_final)
                 sender = asyncio.create_task(
-                    stream_audio(websocket, process, stop_event)
+                    stream_audio(websocket, process, stop_event, turn_detector)
                 )
                 receiver = asyncio.create_task(
-                    receive_events(websocket, reducer, completion_changed)
+                    receive_events(websocket, reducer, progress_changed)
                 )
                 stopper = asyncio.create_task(stop_event.wait())
                 tasks.extend([sender, receiver, stopper])
@@ -374,13 +441,18 @@ async def run_transcription(device: int, api_key: str, ffmpeg: str) -> Path:
                     stop_event.set()
                     await stop_process(process)
                     await asyncio.gather(sender, return_exceptions=True)
-                    if reducer.active_item_id is not None:
+                    if turn_detector.has_buffered_audio():
                         await websocket.send(
                             json.dumps({"type": "input_audio_buffer.commit"})
                         )
+                        turn_detector.mark_committed()
                     try:
                         await asyncio.wait_for(
-                            wait_for_pending(reducer, completion_changed),
+                            wait_for_committed_transcripts(
+                                reducer,
+                                progress_changed,
+                                turn_detector.commits_sent,
+                            ),
                             timeout=FINAL_WAIT_SECONDS,
                         )
                     except TimeoutError:
@@ -427,7 +499,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        output_path = asyncio.run(run_transcription(args.device, api_key, ffmpeg))
+        output_path = asyncio.run(
+            run_transcription(
+                args.device,
+                api_key,
+                ffmpeg,
+                args.silence_threshold,
+            )
+        )
     except TranscriptionError as error:
         print(f"エラー: {error}", file=sys.stderr)
         return 1

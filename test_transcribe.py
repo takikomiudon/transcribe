@@ -15,20 +15,47 @@ import transcribe
 def test_model_configuration() -> None:
     assert (
         transcribe.WEBSOCKET_URL
-        == "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1"
+        == "wss://api.openai.com/v1/realtime?intent=transcription"
     )
     session = transcribe.session_update()["session"]
     assert session["type"] == "transcription"
     assert session["audio"]["input"]["transcription"]["model"] == (
         "gpt-live-transcribe"
     )
+    assert session["audio"]["input"]["turn_detection"] is None
+    assert transcribe.CHUNK_MILLISECONDS == 10
+
+
+def test_local_turn_detection() -> None:
+    loud = (transcribe.SILENCE_RMS_THRESHOLD + 1).to_bytes(
+        2, "little", signed=True
+    ) * (transcribe.CHUNK_BYTES // 2)
+    silence = bytes(transcribe.CHUNK_BYTES)
+    detector = transcribe.LocalTurnDetector()
+
+    assert not detector.observe(loud)
+    silence_chunks = (
+        transcribe.SILENCE_COMMIT_MILLISECONDS // transcribe.CHUNK_MILLISECONDS
+    )
+    for _ in range(silence_chunks - 1):
+        assert not detector.observe(silence)
+    assert detector.observe(silence)
+
+    detector.mark_committed()
+    assert detector.commits_sent == 1
+    assert not detector.has_buffered_audio()
+
+    max_chunks = transcribe.MAX_TURN_MILLISECONDS // transcribe.CHUNK_MILLISECONDS
+    for _ in range(max_chunks - 1):
+        assert not detector.observe(loud)
+    assert detector.observe(loud)
 
 
 def test_event_order_and_deduplication() -> None:
     written: list[str] = []
     reducer = transcribe.TranscriptReducer(written.append)
 
-    reducer.handle({"type": "input_audio_buffer.speech_started", "item_id": "a"})
+    reducer.handle({"type": "input_audio_buffer.committed", "item_id": "a"})
     reducer.handle(
         {
             "type": "conversation.item.input_audio_transcription.delta",
@@ -43,7 +70,7 @@ def test_event_order_and_deduplication() -> None:
             "delta": "world",
         }
     )
-    reducer.handle({"type": "input_audio_buffer.speech_started", "item_id": "b"})
+    reducer.handle({"type": "input_audio_buffer.committed", "item_id": "b"})
     reducer.handle(
         {
             "type": "conversation.item.input_audio_transcription.completed",
@@ -62,6 +89,7 @@ def test_event_order_and_deduplication() -> None:
     )
     assert reducer.partials["a"] == "Hello world"
     assert written == ["First.", "Second."]
+    assert reducer.committed_item_ids == {"a", "b"}
 
     reducer.handle(
         {
@@ -92,8 +120,8 @@ async def test_capture_eof_and_process_cleanup() -> None:
             return b"capture failed"
 
     class EmptyStdout:
-        async def read(self, _: int = -1) -> bytes:
-            return b""
+        async def readexactly(self, expected: int) -> bytes:
+            raise asyncio.IncompleteReadError(partial=b"", expected=expected)
 
     class FakeProcess:
         stdout = EmptyStdout()
@@ -105,7 +133,10 @@ async def test_capture_eof_and_process_cleanup() -> None:
 
     try:
         await transcribe.stream_audio(
-            FakeWebSocket(), FakeProcess(), asyncio.Event()  # type: ignore[arg-type]
+            FakeWebSocket(),
+            FakeProcess(),  # type: ignore[arg-type]
+            asyncio.Event(),
+            transcribe.LocalTurnDetector(),
         )
     except transcribe.CaptureError as error:
         assert "capture failed" in str(error)
@@ -153,6 +184,7 @@ async def test_websocket_error_preserves_completed_output() -> None:
 
 def main() -> None:
     test_model_configuration()
+    test_local_turn_detection()
     test_event_order_and_deduplication()
     test_missing_key_stops_before_capture()
     asyncio.run(test_capture_eof_and_process_cleanup())
