@@ -11,6 +11,13 @@ macOSの日本語・英語・韓国語音声を `gpt-live-transcribe` でリア�
 
 `.env.local` はGit管理外です。APIキーの値をソースコードやコミットへ入れないでください。
 
+Raycastから起動する場合は、使用する音声入力番号も設定できます。未設定時は `0` を使用します。
+
+```sh
+OPENAI_API_KEY='your-api-key'
+TRANSCRIBE_DEVICE=0
+```
+
 ## 使い方
 
 最初に音声入力番号を確認します。
@@ -42,3 +49,14 @@ uv run transcribe.py --device 0 --translate-ja
 システム音声を入力として扱うには、BlackHoleを別途インストールし、「Audio MIDI設定」で通常の出力先とBlackHoleを含む複数出力装置を作成します。その後、`--list-devices` に表示されるBlackHoleの番号を指定します。
 
 この最小版は入力を1つだけ扱います。マイクとの同時ミックス、話者分離、音声保存、自動再接続は行いません。
+
+## Raycastから起動
+
+Raycastの「Settings → Extensions」で `+` を押し、「Add Script Directory」からこのリポジトリの `raycast` ディレクトリを追加します。次の2コマンドが使えるようになります。
+
+- `文字起こしを開始`
+- `日本語訳付き文字起こしを開始`
+
+初回起動時にmacOSから求められたら、RaycastによるTerminalの操作を許可してください。各コマンドにはRaycastの設定から任意のホットキーを割り当てられます。
+
+起動には `Live Transcribe` という専用Terminalタブを1つだけ使用します。文字起こし中にどちらかのコマンドを再実行した場合は、新しく起動せず、そのタブを前面へ表示します。終了するときは専用タブで `Ctrl-C` を押してください。終了後は、どちらかのコマンドを実行すると同じタブで再開します。
