@@ -57,6 +57,25 @@ def test_translation_flag() -> None:
     assert args.translate_ja
 
 
+def test_api_key_auto_load() -> None:
+    with (
+        patch.dict(os.environ, {}, clear=True),
+        patch.object(
+            transcribe.Path,
+            "read_text",
+            return_value="export OPENAI_API_KEY='from-file'\n",
+        ),
+    ):
+        assert transcribe.load_api_key() == "from-file"
+
+    with (
+        patch.dict(os.environ, {"OPENAI_API_KEY": "from-env"}, clear=True),
+        patch.object(transcribe.Path, "read_text") as read_text,
+    ):
+        assert transcribe.load_api_key() == "from-env"
+        read_text.assert_not_called()
+
+
 def test_local_turn_detection() -> None:
     loud = (transcribe.SILENCE_RMS_THRESHOLD + 1).to_bytes(
         2, "little", signed=True
@@ -190,6 +209,7 @@ def test_missing_key_stops_before_capture() -> None:
     with (
         patch.dict(os.environ, {}, clear=True),
         patch("transcribe.shutil.which", return_value="/usr/local/bin/ffmpeg"),
+        patch("transcribe.load_api_key", return_value=""),
         patch("transcribe.asyncio.run") as run,
         redirect_stderr(stderr),
     ):
@@ -270,6 +290,7 @@ def main() -> None:
     test_model_configuration()
     test_translation_configuration_and_output()
     test_translation_flag()
+    test_api_key_auto_load()
     test_local_turn_detection()
     asyncio.run(test_idle_silence_is_not_uploaded())
     test_event_order_and_deduplication()

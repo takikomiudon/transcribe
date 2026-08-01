@@ -43,6 +43,7 @@ SILENCE_COMMIT_MILLISECONDS = 800
 MAX_TURN_MILLISECONDS = 30_000
 FINAL_WAIT_SECONDS = 5
 TRANSLATION_TIMEOUT_SECONDS = 20
+ENV_FILE = Path(".env.local")
 
 
 class TranscriptionError(Exception):
@@ -223,6 +224,27 @@ def non_negative_integer(value: str) -> int:
     if number < 0:
         raise argparse.ArgumentTypeError("0以上の整数を指定してください")
     return number
+
+
+def load_api_key(env_file: Path = ENV_FILE) -> str:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if api_key:
+        return api_key
+    try:
+        lines = env_file.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return ""
+    for line in lines:
+        line = line.strip()
+        if line.startswith("export "):
+            line = line.removeprefix("export ").lstrip()
+        name, separator, value = line.partition("=")
+        if separator and name.strip() == "OPENAI_API_KEY":
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            return value.strip()
+    return ""
 
 
 def parse_audio_devices(output: str) -> list[tuple[int, str]]:
@@ -618,9 +640,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_devices:
         return list_audio_devices(ffmpeg)
 
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    try:
+        api_key = load_api_key()
+    except OSError as error:
+        print(f".env.localを読み込めませんでした: {error}", file=sys.stderr)
+        return 2
     if not api_key:
-        print("OPENAI_API_KEYが設定されていません。", file=sys.stderr)
+        print(
+            "OPENAI_API_KEYが環境変数または.env.localに設定されていません。",
+            file=sys.stderr,
+        )
         return 2
 
     try:
