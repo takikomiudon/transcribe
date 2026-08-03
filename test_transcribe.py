@@ -192,6 +192,56 @@ async def test_idle_silence_is_not_uploaded() -> None:
     assert websocket.messages == []
 
 
+async def test_long_idle_sends_minimal_keepalive() -> None:
+    class IdleStdout:
+        def __init__(self) -> None:
+            self.remaining = (
+                transcribe.KEEPALIVE_INTERVAL_MILLISECONDS
+                // transcribe.CHUNK_MILLISECONDS
+            )
+
+        async def readexactly(self, expected: int) -> bytes:
+            if self.remaining:
+                self.remaining -= 1
+                return bytes(expected)
+            raise asyncio.IncompleteReadError(partial=b"", expected=expected)
+
+    class ErrorReader:
+        async def read(self, _: int = -1) -> bytes:
+            return b"capture ended"
+
+    class FakeProcess:
+        stdout = IdleStdout()
+        stderr = ErrorReader()
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def send(self, message: str) -> None:
+            self.messages.append(message)
+
+    websocket = FakeWebSocket()
+    try:
+        await transcribe.stream_audio(
+            websocket,
+            FakeProcess(),  # type: ignore[arg-type]
+            asyncio.Event(),
+            transcribe.LocalTurnDetector(),
+        )
+    except transcribe.CaptureError:
+        pass
+    else:
+        raise AssertionError("CaptureError was not raised")
+
+    assert len(websocket.messages) == 1
+    message = json.loads(websocket.messages[0])
+    assert message["commit"] is False
+    assert base64.b64decode(message["audio_base_64"]) == bytes(
+        transcribe.UPLOAD_CHUNK_BYTES
+    )
+
+
 async def test_audio_chunks_are_batched_and_committed() -> None:
     class OneChunkStdout:
         def __init__(self) -> None:
@@ -678,6 +728,7 @@ def main() -> None:
     test_api_key_auto_load()
     test_local_turn_detection()
     asyncio.run(test_idle_silence_is_not_uploaded())
+    asyncio.run(test_long_idle_sends_minimal_keepalive())
     asyncio.run(test_audio_chunks_are_batched_and_committed())
     asyncio.run(test_stop_commits_buffered_audio())
     test_realtime_events_and_repeated_transcripts()

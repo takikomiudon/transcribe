@@ -48,6 +48,7 @@ CHUNK_MILLISECONDS = 10
 CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MILLISECONDS // 1_000
 UPLOAD_CHUNK_MILLISECONDS = 100
 UPLOAD_CHUNK_BYTES = SAMPLE_RATE * 2 * UPLOAD_CHUNK_MILLISECONDS // 1_000
+KEEPALIVE_INTERVAL_MILLISECONDS = 5_000
 SILENCE_RMS_THRESHOLD = 500
 PRE_ROLL_MILLISECONDS = 500
 SILENCE_COMMIT_MILLISECONDS = 800
@@ -437,6 +438,7 @@ async def stream_audio(
 ) -> None:
     assert process.stdout is not None
     upload_buffer = bytearray()
+    idle_milliseconds = 0
 
     async def send_audio(audio: bytes) -> None:
         await websocket.send(
@@ -480,6 +482,13 @@ async def stream_audio(
         if stop_event.is_set():
             break
         chunks, should_commit = turn_detector.observe(chunk)
+        if chunks:
+            idle_milliseconds = 0
+        else:
+            idle_milliseconds += CHUNK_MILLISECONDS
+            if idle_milliseconds >= KEEPALIVE_INTERVAL_MILLISECONDS:
+                await send_audio(bytes(UPLOAD_CHUNK_BYTES))
+                idle_milliseconds = 0
         for upload_chunk in chunks:
             upload_buffer.extend(upload_chunk)
             while len(upload_buffer) >= UPLOAD_CHUNK_BYTES:
