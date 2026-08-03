@@ -3,35 +3,36 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
+import json
 import os
 import sys
 import tempfile
 from contextlib import redirect_stderr
 from pathlib import Path
 from types import ModuleType
+from urllib.parse import parse_qs, urlparse
 from unittest.mock import patch
 
 import transcribe
 
 
 def test_model_configuration() -> None:
-    assert (
-        transcribe.WEBSOCKET_URL
-        == "wss://api.openai.com/v1/realtime?intent=transcription"
-    )
-    session = transcribe.session_update()["session"]
-    assert session["type"] == "transcription"
-    assert session["audio"]["input"]["transcription"]["model"] == (
-        "gpt-live-transcribe"
-    )
-    assert session["audio"]["input"]["transcription"]["languages"] == [
-        "ja",
-        "en",
-        "ko",
-    ]
-    assert session["audio"]["input"]["turn_detection"] is None
+    parsed = urlparse(transcribe.realtime_url())
+    assert parsed.scheme == "wss"
+    assert parsed.netloc == "api.elevenlabs.io"
+    assert parsed.path == "/v1/speech-to-text/realtime"
+    assert parse_qs(parsed.query) == {
+        "model_id": ["scribe_v2_realtime"],
+        "audio_format": ["pcm_16000"],
+        "commit_strategy": ["manual"],
+        "language_code": ["ja"],
+        "secondary_languages": ["en", "ko"],
+    }
+    assert transcribe.SAMPLE_RATE == 16_000
     assert transcribe.CHUNK_MILLISECONDS == 10
+    assert transcribe.UPLOAD_CHUNK_MILLISECONDS == 100
 
 
 def test_translation_configuration_and_output() -> None:
@@ -89,16 +90,28 @@ def test_api_key_auto_load() -> None:
         patch.object(
             transcribe.Path,
             "read_text",
-            return_value="export OPENAI_API_KEY='from-file'\n",
+            return_value=(
+                "export ELEVENLABS_API_KEY='eleven-from-file'\n"
+                "OPENAI_API_KEY='openai-from-file'\n"
+            ),
         ),
     ):
-        assert transcribe.load_api_key() == "from-file"
+        assert transcribe.load_elevenlabs_api_key() == "eleven-from-file"
+        assert transcribe.load_openai_api_key() == "openai-from-file"
 
     with (
-        patch.dict(os.environ, {"OPENAI_API_KEY": "from-env"}, clear=True),
+        patch.dict(
+            os.environ,
+            {
+                "ELEVENLABS_API_KEY": "eleven-from-env",
+                "OPENAI_API_KEY": "openai-from-env",
+            },
+            clear=True,
+        ),
         patch.object(transcribe.Path, "read_text") as read_text,
     ):
-        assert transcribe.load_api_key() == "from-env"
+        assert transcribe.load_elevenlabs_api_key() == "eleven-from-env"
+        assert transcribe.load_openai_api_key() == "openai-from-env"
         read_text.assert_not_called()
 
 
@@ -179,55 +192,144 @@ async def test_idle_silence_is_not_uploaded() -> None:
     assert websocket.messages == []
 
 
-def test_event_order_and_deduplication() -> None:
+async def test_audio_chunks_are_batched_and_committed() -> None:
+    class OneChunkStdout:
+        def __init__(self) -> None:
+            self.sent = False
+
+        async def readexactly(self, expected: int) -> bytes:
+            if not self.sent:
+                self.sent = True
+                return bytes(expected)
+            raise asyncio.IncompleteReadError(partial=b"", expected=expected)
+
+    class ErrorReader:
+        async def read(self, _: int = -1) -> bytes:
+            return b"capture ended"
+
+    class FakeProcess:
+        stdout = OneChunkStdout()
+        stderr = ErrorReader()
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def send(self, message: str) -> None:
+            self.messages.append(message)
+
+    class FakeDetector:
+        commits_sent = 0
+
+        def observe(self, _: bytes) -> tuple[list[bytes], bool]:
+            return [b"x" * transcribe.CHUNK_BYTES] * 11, True
+
+        def mark_committed(self) -> None:
+            self.commits_sent += 1
+
+        def has_buffered_audio(self) -> bool:
+            return False
+
+    websocket = FakeWebSocket()
+    try:
+        await transcribe.stream_audio(
+            websocket,
+            FakeProcess(),  # type: ignore[arg-type]
+            asyncio.Event(),
+            FakeDetector(),  # type: ignore[arg-type]
+        )
+    except transcribe.CaptureError:
+        pass
+    else:
+        raise AssertionError("CaptureError was not raised")
+
+    messages = [json.loads(message) for message in websocket.messages]
+    assert [message["message_type"] for message in messages] == [
+        "input_audio_chunk",
+        "input_audio_chunk",
+        "input_audio_chunk",
+    ]
+    assert len(base64.b64decode(messages[0]["audio_base_64"])) == (
+        transcribe.UPLOAD_CHUNK_BYTES
+    )
+    assert len(base64.b64decode(messages[1]["audio_base_64"])) == (
+        transcribe.CHUNK_BYTES
+    )
+    assert messages[0]["sample_rate"] == transcribe.SAMPLE_RATE
+    assert messages[0]["commit"] is False
+    assert messages[2] == {
+        "message_type": "input_audio_chunk",
+        "audio_base_64": "",
+        "commit": True,
+        "sample_rate": transcribe.SAMPLE_RATE,
+    }
+
+
+async def test_stop_commits_buffered_audio() -> None:
+    stop_event = asyncio.Event()
+
+    class StoppedStdout:
+        async def readexactly(self, expected: int) -> bytes:
+            stop_event.set()
+            raise asyncio.IncompleteReadError(partial=b"", expected=expected)
+
+    class FakeProcess:
+        stdout = StoppedStdout()
+        stderr = None
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def send(self, message: str) -> None:
+            self.messages.append(message)
+
+    class FakeDetector:
+        commits_sent = 0
+
+        def observe(self, _: bytes) -> tuple[list[bytes], bool]:
+            raise AssertionError("audio should not be observed")
+
+        def mark_committed(self) -> None:
+            self.commits_sent += 1
+
+        def has_buffered_audio(self) -> bool:
+            return True
+
+    websocket = FakeWebSocket()
+    detector = FakeDetector()
+    await transcribe.stream_audio(
+        websocket,
+        FakeProcess(),  # type: ignore[arg-type]
+        stop_event,
+        detector,  # type: ignore[arg-type]
+    )
+
+    assert detector.commits_sent == 1
+    assert json.loads(websocket.messages[-1]) == {
+        "message_type": "input_audio_chunk",
+        "audio_base_64": "",
+        "commit": True,
+        "sample_rate": transcribe.SAMPLE_RATE,
+    }
+
+
+def test_realtime_events_and_repeated_transcripts() -> None:
     written: list[str] = []
     reducer = transcribe.TranscriptReducer(written.append)
 
-    reducer.handle({"type": "input_audio_buffer.committed", "item_id": "a"})
-    reducer.handle(
-        {
-            "type": "conversation.item.input_audio_transcription.delta",
-            "item_id": "a",
-            "delta": "Hello ",
-        }
-    )
-    reducer.handle(
-        {
-            "type": "conversation.item.input_audio_transcription.delta",
-            "item_id": "a",
-            "delta": "world",
-        }
-    )
-    reducer.handle({"type": "input_audio_buffer.committed", "item_id": "b"})
-    reducer.handle(
-        {
-            "type": "conversation.item.input_audio_transcription.completed",
-            "item_id": "b",
-            "transcript": "Second.",
-        }
-    )
-    assert written == []
-
-    reducer.handle(
-        {
-            "type": "conversation.item.input_audio_transcription.completed",
-            "item_id": "a",
-            "transcript": "First.",
-        }
-    )
-    assert reducer.partials["a"] == "Hello world"
-    assert written == ["First.", "Second."]
-    assert reducer.take_ready() == ["First.", "Second."]
-    assert reducer.committed_item_ids == {"a", "b"}
-
-    reducer.handle(
-        {
-            "type": "conversation.item.input_audio_transcription.completed",
-            "item_id": "a",
-            "transcript": "Duplicate.",
-        }
-    )
-    assert written == ["First.", "Second."]
+    assert reducer.handle(
+        {"message_type": "partial_transcript", "text": "Hello wor"}
+    ) == ("Hello wor", False)
+    assert reducer.handle(
+        {"message_type": "committed_transcript", "text": "Hello world"}
+    ) == ("Hello world", True)
+    assert reducer.handle(
+        {"message_type": "committed_transcript", "text": "Hello world"}
+    ) == ("Hello world", True)
+    assert written == ["Hello world", "Hello world"]
+    assert reducer.take_ready() == ["Hello world", "Hello world"]
+    assert reducer.commits_received == 2
 
 
 def test_missing_key_stops_before_capture() -> None:
@@ -235,13 +337,13 @@ def test_missing_key_stops_before_capture() -> None:
     with (
         patch.dict(os.environ, {}, clear=True),
         patch("transcribe.shutil.which", return_value="/usr/local/bin/ffmpeg"),
-        patch("transcribe.load_api_key", return_value=""),
+        patch("transcribe.load_elevenlabs_api_key", return_value=""),
         patch("transcribe.asyncio.run") as run,
         redirect_stderr(stderr),
     ):
         assert transcribe.main(["--device", "0"]) == 2
     run.assert_not_called()
-    assert "OPENAI_API_KEY" in stderr.getvalue()
+    assert "ELEVENLABS_API_KEY" in stderr.getvalue()
 
 
 async def test_capture_eof_and_process_cleanup() -> None:
@@ -284,10 +386,9 @@ async def test_capture_eof_and_process_cleanup() -> None:
 
 async def test_websocket_error_preserves_completed_output() -> None:
     messages = [
-        '{"type":"input_audio_buffer.speech_started","item_id":"a"}',
-        '{"type":"conversation.item.input_audio_transcription.completed",'
-        '"item_id":"a","transcript":"Saved."}',
-        '{"type":"error","error":{"message":"network failed"}}',
+        '{"message_type":"session_started","session_id":"a"}',
+        '{"message_type":"committed_transcript","text":"Saved."}',
+        '{"message_type":"rate_limited","error":"network failed"}',
     ]
 
     class FakeWebSocket:
@@ -371,7 +472,10 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
         async def __aexit__(self, *_: object) -> None:
             return None
 
-    def connect(*_: object, **__: object) -> FakeConnection:
+    connect_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def connect(*args: object, **options: object) -> FakeConnection:
+        connect_calls.append((args, options))
         return FakeConnection()
 
     client_module = ModuleType("websockets.asyncio.client")
@@ -425,11 +529,14 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
             patch("transcribe.stream_audio", fake_stream),
             patch("transcribe.receive_events", fake_receive),
             patch("transcribe.transcript_path", return_value=transcript_path),
-            patch("transcribe.translate_to_japanese", return_value="日本語訳"),
+            patch(
+                "transcribe.translate_to_japanese", return_value="日本語訳"
+            ) as translate,
         ):
             result = await transcribe.run_transcription(
                 0,
-                "api-key",
+                "eleven-key",
+                "openai-key",
                 "/usr/bin/ffmpeg",
                 translate_to_ja=True,
                 cards_enabled=True,
@@ -444,8 +551,13 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
     assert result == transcript_path
     assert "Original text" in saved
     assert "日本語訳" in saved
+    assert connect_calls[0][0] == (transcribe.realtime_url(),)
+    assert connect_calls[0][1]["additional_headers"] == {
+        "xi-api-key": "eleven-key"
+    }
+    translate.assert_called_once_with("Original text", "openai-key")
     pipeline = pipeline_instances[0]
-    assert pipeline.api_key == "api-key"
+    assert pipeline.api_key == "openai-key"
     assert pipeline.options == {
         "character_threshold": 120,
         "idle_seconds": 8,
@@ -470,7 +582,9 @@ def main() -> None:
     test_api_key_auto_load()
     test_local_turn_detection()
     asyncio.run(test_idle_silence_is_not_uploaded())
-    test_event_order_and_deduplication()
+    asyncio.run(test_audio_chunks_are_batched_and_committed())
+    asyncio.run(test_stop_commits_buffered_audio())
+    test_realtime_events_and_repeated_transcripts()
     test_missing_key_stops_before_capture()
     asyncio.run(test_capture_eof_and_process_cleanup())
     asyncio.run(test_websocket_error_preserves_completed_output())
