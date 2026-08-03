@@ -1,6 +1,6 @@
 # Minimal Realtime Transcription CLI
 
-macOSの日本語・英語・韓国語音声をElevenLabs `scribe_v2_realtime` でリアルタイム文字起こしし、確定した文章をMarkdownへ保存する最小CLIです。日本語を主言語、英語・韓国語を副言語として認識します。
+macOSの日本語・英語・韓国語音声をElevenLabs Scribe Realtimeでリアルタイム文字起こしし、確定した文章をMarkdownへ保存する最小CLIです。日本語を主言語、英語・韓国語を副言語として認識します。
 
 ## 必要なもの
 
@@ -47,7 +47,7 @@ uv run transcribe.py --device 0
 
 途中結果はターミナルへ表示され、確定結果は `transcripts/YYYYMMDD-HHMMSS.md` へ逐次保存されます。終了は `Ctrl-C` です。
 
-英語・韓国語の確定結果を日本語でも保存する場合は、`--translate-ja` を追加します。原文の文字起こしにはElevenLabs `scribe_v2_realtime`、日本語訳にはOpenAI `gpt-5.6-luna` を使用するため、翻訳分のAPI料金が別途かかります。
+英語・韓国語の確定結果を日本語でも保存する場合は、`--translate-ja` を追加します。原文の文字起こしにはElevenLabs Scribe Realtime、日本語訳にはOpenAI `gpt-5.6-luna` を使用するため、翻訳分のAPI料金が別途かかります。
 
 ```sh
 uv run transcribe.py --device 0 --translate-ja

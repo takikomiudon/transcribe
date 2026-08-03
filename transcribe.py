@@ -423,7 +423,7 @@ def write_header(file: Any, device: int, translate_to_ja: bool = False) -> None:
         "# Transcript\n\n"
         f"- Started: {started}\n"
         f"- Device: {device}\n"
-        f"- Model: `{MODEL}`\n"
+        "- Model: `ElevenLabs Scribe Realtime`\n"
         f"{translation}\n"
         "## Transcript\n\n"
     )

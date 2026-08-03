@@ -54,6 +54,14 @@ def test_translation_configuration_and_output() -> None:
     ) == "こんにちは。"
 
 
+def test_transcript_header_hides_model_version() -> None:
+    output = io.StringIO()
+    transcribe.write_header(output, 0)
+    header = output.getvalue()
+    assert "- Model: `ElevenLabs Scribe Realtime`" in header
+    assert "scribe_v2_realtime" not in header
+
+
 def test_translation_flag() -> None:
     args = transcribe.build_parser().parse_args(
         ["--device", "0", "--translate-ja"]
@@ -723,6 +731,7 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
 def main() -> None:
     test_model_configuration()
     test_translation_configuration_and_output()
+    test_transcript_header_hides_model_version()
     test_translation_flag()
     test_cards_flags()
     test_api_key_auto_load()
