@@ -159,7 +159,7 @@ def test_local_turn_detection() -> None:
     assert detector.observe(loud) == ([loud], True)
 
 
-def test_one_second_pause_does_not_split_a_turn() -> None:
+def test_one_second_pause_splits_a_turn() -> None:
     loud = (transcribe.SILENCE_RMS_THRESHOLD + 1).to_bytes(
         2, "little", signed=True
     ) * (transcribe.CHUNK_BYTES // 2)
@@ -167,8 +167,9 @@ def test_one_second_pause_does_not_split_a_turn() -> None:
     detector = transcribe.LocalTurnDetector()
 
     assert detector.observe(loud) == ([loud], False)
-    for _ in range(1_000 // transcribe.CHUNK_MILLISECONDS):
+    for _ in range(1_000 // transcribe.CHUNK_MILLISECONDS - 1):
         assert detector.observe(silence) == ([silence], False)
+    assert detector.observe(silence) == ([silence], True)
 
 
 async def test_idle_silence_is_not_uploaded() -> None:
@@ -748,7 +749,7 @@ def main() -> None:
     test_cards_flags()
     test_api_key_auto_load()
     test_local_turn_detection()
-    test_one_second_pause_does_not_split_a_turn()
+    test_one_second_pause_splits_a_turn()
     asyncio.run(test_idle_silence_is_not_uploaded())
     asyncio.run(test_long_idle_sends_minimal_keepalive())
     asyncio.run(test_audio_chunks_are_batched_and_committed())
