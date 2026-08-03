@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import tempfile
+import wave
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import ModuleType
@@ -199,18 +200,21 @@ async def test_idle_silence_is_not_uploaded() -> None:
             self.messages.append(message)
 
     websocket = FakeWebSocket()
+    recorded = bytearray()
     try:
         await transcribe.stream_audio(
             websocket,
             FakeProcess(),  # type: ignore[arg-type]
             asyncio.Event(),
             transcribe.LocalTurnDetector(),
+            recorded.extend,
         )
     except transcribe.CaptureError:
         pass
     else:
         raise AssertionError("CaptureError was not raised")
     assert websocket.messages == []
+    assert recorded == bytes(transcribe.CHUNK_BYTES * 100)
 
 
 async def test_long_idle_sends_minimal_keepalive() -> None:
@@ -249,6 +253,7 @@ async def test_long_idle_sends_minimal_keepalive() -> None:
             FakeProcess(),  # type: ignore[arg-type]
             asyncio.Event(),
             transcribe.LocalTurnDetector(),
+            lambda _: None,
         )
     except transcribe.CaptureError:
         pass
@@ -308,6 +313,7 @@ async def test_audio_chunks_are_batched_and_committed() -> None:
             FakeProcess(),  # type: ignore[arg-type]
             asyncio.Event(),
             FakeDetector(),  # type: ignore[arg-type]
+            lambda _: None,
         )
     except transcribe.CaptureError:
         pass
@@ -374,6 +380,7 @@ async def test_stop_commits_buffered_audio() -> None:
         FakeProcess(),  # type: ignore[arg-type]
         stop_event,
         detector,  # type: ignore[arg-type]
+        lambda _: None,
     )
 
     assert detector.commits_sent == 1
@@ -474,6 +481,7 @@ async def test_capture_eof_and_process_cleanup() -> None:
             FakeProcess(),  # type: ignore[arg-type]
             asyncio.Event(),
             transcribe.LocalTurnDetector(),
+            lambda _: None,
         )
     except transcribe.CaptureError as error:
         assert "capture failed" in str(error)
@@ -659,7 +667,10 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
         __: object,
         stop_event: asyncio.Event,
         ___: object,
+        record_audio: object,
     ) -> None:
+        assert callable(record_audio)
+        record_audio(bytes(transcribe.CHUNK_BYTES))
         await finalized.wait()
         stop_event.set()
 
@@ -676,6 +687,7 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         transcript_path = Path(directory) / "transcript.md"
+        recording_path = Path(directory) / "recording.wav"
         with (
             patch.dict(
                 sys.modules,
@@ -696,6 +708,7 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
             patch("transcribe.stream_audio", fake_stream),
             patch("transcribe.receive_events", fake_receive),
             patch("transcribe.transcript_path", return_value=transcript_path),
+            patch("transcribe.recording_path", return_value=recording_path),
             patch(
                 "transcribe.translate_to_japanese", return_value="日本語訳"
             ) as translate,
@@ -714,8 +727,15 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
             )
 
         saved = transcript_path.read_text(encoding="utf-8")
+        with wave.open(str(recording_path), "rb") as recording:
+            assert recording.getnchannels() == 1
+            assert recording.getsampwidth() == 2
+            assert recording.getframerate() == transcribe.SAMPLE_RATE
+            assert recording.readframes(recording.getnframes()) == bytes(
+                transcribe.CHUNK_BYTES
+            )
 
-    assert result == transcript_path
+    assert result == (transcript_path, recording_path)
     assert "Original text" in saved
     assert "日本語訳" in saved
     assert connect_calls[0][0] == (transcribe.realtime_url(),)

@@ -22,6 +22,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import wave
 from array import array
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -357,6 +358,12 @@ def transcript_path(now: datetime | None = None) -> Path:
     return candidate
 
 
+def recording_path(transcript: Path) -> Path:
+    output_dir = Path("recordings")
+    output_dir.mkdir(exist_ok=True)
+    return output_dir / f"{transcript.stem}.wav"
+
+
 def translation_payload(text: str) -> dict[str, Any]:
     return {
         "model": TRANSLATION_MODEL,
@@ -435,6 +442,7 @@ async def stream_audio(
     process: asyncio.subprocess.Process,
     stop_event: asyncio.Event,
     turn_detector: LocalTurnDetector,
+    record_audio: Callable[[bytes], None],
 ) -> None:
     assert process.stdout is not None
     upload_buffer = bytearray()
@@ -479,6 +487,7 @@ async def stream_audio(
                 stderr = await process.stderr.read()
             detail = stderr.decode(errors="replace").strip()
             raise CaptureError(detail or "音声入力が終了しました。")
+        record_audio(chunk)
         if stop_event.is_set():
             break
         chunks, should_commit = turn_detector.observe(chunk)
@@ -585,7 +594,7 @@ async def run_transcription(
     cards_character_threshold: int = CARD_CHARACTER_THRESHOLD,
     cards_idle_seconds: int = CARD_IDLE_SECONDS,
     cards_max_seconds: int = CARD_MAX_SECONDS,
-) -> Path:
+) -> tuple[Path, Path]:
     try:
         from websockets.asyncio.client import connect
     except ImportError as error:
@@ -646,9 +655,18 @@ async def run_transcription(
             )
 
             output_path = transcript_path()
-            with output_path.open("x", encoding="utf-8") as transcript:
+            audio_path = recording_path(output_path)
+            with (
+                audio_path.open("xb") as audio_file,
+                wave.open(audio_file, "wb") as recording,
+                output_path.open("x", encoding="utf-8") as transcript,
+            ):
+                recording.setnchannels(1)
+                recording.setsampwidth(2)
+                recording.setframerate(SAMPLE_RATE)
                 write_header(transcript, device, translate_to_ja)
                 print(f"保存先: {output_path}")
+                print(f"録音先: {audio_path}")
 
                 def write_final(text: str) -> None:
                     transcript.write(text + "\n\n")
@@ -681,7 +699,13 @@ async def run_transcription(
                     (lambda _: None) if needs_finalize else write_final
                 )
                 sender = asyncio.create_task(
-                    stream_audio(websocket, process, stop_event, turn_detector)
+                    stream_audio(
+                        websocket,
+                        process,
+                        stop_event,
+                        turn_detector,
+                        recording.writeframesraw,
+                    )
                 )
                 receiver = asyncio.create_task(
                     receive_events(
@@ -718,7 +742,7 @@ async def run_transcription(
                 else:
                     receiver.result()
 
-            return output_path
+            return output_path, audio_path
     except TranscriptionError:
         raise
     except OSError as error:
