@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -329,7 +330,7 @@ def generate_card(
         sanitized_html = sanitize_card_html(raw_html)
         if not title or not sanitized_html:
             raise CardGenerationError("図解生成のタイトルまたはHTMLが空です。")
-    total_tokens = payload.get("usage", {}).get("total_tokens")
+    total_tokens = (payload.get("usage") or {}).get("total_tokens")
     return {
         "decision": decision,
         "title": title,
@@ -462,8 +463,8 @@ class CardPipeline:
 
     async def _generate(self, source_text: str) -> None:
         last_error: Exception | None = None
+        started = time.perf_counter()
         for _ in range(2):
-            started = time.perf_counter()
             try:
                 result = await asyncio.to_thread(
                     self.generator,
@@ -499,7 +500,11 @@ class CardPipeline:
                 status="error",
             )
         )
-        print(f"[cards] 警告: {last_error or message}", flush=True)
+        print(
+            f"[cards] error: {time.perf_counter() - started:.1f}s, tokens unknown",
+            flush=True,
+        )
+        print(f"[cards] 警告: {last_error or message}", file=sys.stderr, flush=True)
 
     def _store_decision(
         self,
@@ -508,7 +513,7 @@ class CardPipeline:
         result: dict[str, object],
     ) -> None:
         title = str(result.get("title", "")).strip()
-        card_html = sanitize_card_html(str(result.get("html", "")))
+        card_html = str(result.get("html", ""))
         previous = self.store.last()
         if decision == "update_last" and previous is not None:
             self.store.replace_last(

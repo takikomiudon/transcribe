@@ -40,6 +40,14 @@ uv run transcribe.py --device 0
 uv run transcribe.py --device 0 --translate-ja
 ```
 
+確定した発話から話題ごとの図解カードを生成する場合は、`--cards` を追加します。ブラウザでローカルビューアが開き、カードが下へ追加されます。終了時には同じ内容を `cards_output/YYYYMMDD-HHMMSS.html` とJSONへ保存します。
+
+```sh
+uv run transcribe.py --device 0 --cards
+```
+
+生成は既定で300文字、20秒間の新規発話なし、または前回生成から90秒のいずれかで始まります。必要なら `--cards-character-threshold`、`--cards-idle-seconds`、`--cards-max-seconds` で調整し、ポート競合時は `--cards-port` を変更できます。`--translate-ja` と同時指定した場合も、図解には翻訳前の原文を使います。
+
 無音待機中の音声はAPIへ送らず、発話開始時に直前500msの音声を付けて送信します。800msの無音または30秒の連続音声で発話を確定します。周囲の雑音で区切られない場合は、`--silence-threshold 800` のように既定値500より大きくしてください。
 
 初回起動時にmacOSから求められたら、ターミナルのマイク利用を許可してください。拒否した場合は「システム設定 → プライバシーとセキュリティ → マイク」から変更できます。

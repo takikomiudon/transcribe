@@ -29,6 +29,14 @@ from math import isqrt
 from pathlib import Path
 from typing import Any
 
+from cards import (
+    CARD_CHARACTER_THRESHOLD,
+    CARD_IDLE_SECONDS,
+    CARD_MAX_SECONDS,
+    CardPipeline,
+)
+from viewer import ViewerServer, export_cards
+
 
 MODEL = "gpt-live-transcribe"
 TRANSLATION_MODEL = "gpt-5.6-luna"
@@ -213,6 +221,39 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="確定した英語・韓国語を日本語へ翻訳",
     )
+    parser.add_argument(
+        "--cards",
+        action="store_true",
+        help="確定した発話から図解カードを生成",
+    )
+    parser.add_argument(
+        "--cards-port",
+        type=port_number,
+        default=8765,
+        metavar="PORT",
+        help="図解ビューアのポート（既定: 8765）",
+    )
+    parser.add_argument(
+        "--cards-character-threshold",
+        type=positive_integer,
+        default=CARD_CHARACTER_THRESHOLD,
+        metavar="CHARS",
+        help=f"カード生成を始める累積文字数（既定: {CARD_CHARACTER_THRESHOLD}）",
+    )
+    parser.add_argument(
+        "--cards-idle-seconds",
+        type=positive_integer,
+        default=CARD_IDLE_SECONDS,
+        metavar="SECONDS",
+        help=f"カード生成を始める無音秒数（既定: {CARD_IDLE_SECONDS}）",
+    )
+    parser.add_argument(
+        "--cards-max-seconds",
+        type=positive_integer,
+        default=CARD_MAX_SECONDS,
+        metavar="SECONDS",
+        help=f"カード生成までの最大秒数（既定: {CARD_MAX_SECONDS}）",
+    )
     return parser
 
 
@@ -223,6 +264,20 @@ def non_negative_integer(value: str) -> int:
         raise argparse.ArgumentTypeError("0以上の整数を指定してください") from error
     if number < 0:
         raise argparse.ArgumentTypeError("0以上の整数を指定してください")
+    return number
+
+
+def positive_integer(value: str) -> int:
+    number = non_negative_integer(value)
+    if number == 0:
+        raise argparse.ArgumentTypeError("1以上の整数を指定してください")
+    return number
+
+
+def port_number(value: str) -> int:
+    number = positive_integer(value)
+    if number > 65_535:
+        raise argparse.ArgumentTypeError("1〜65535のポート番号を指定してください")
     return number
 
 
@@ -518,6 +573,11 @@ async def run_transcription(
     ffmpeg: str,
     silence_rms_threshold: int = SILENCE_RMS_THRESHOLD,
     translate_to_ja: bool = False,
+    cards_enabled: bool = False,
+    cards_port: int = 8765,
+    cards_character_threshold: int = CARD_CHARACTER_THRESHOLD,
+    cards_idle_seconds: int = CARD_IDLE_SECONDS,
+    cards_max_seconds: int = CARD_MAX_SECONDS,
 ) -> Path:
     try:
         from websockets.asyncio.client import connect
@@ -531,6 +591,40 @@ async def run_transcription(
     loop.add_signal_handler(signal.SIGINT, stop_event.set)
     process: asyncio.subprocess.Process | None = None
     tasks: list[asyncio.Task[Any]] = []
+    pipeline: CardPipeline | None = None
+    viewer_server: ViewerServer | None = None
+
+    if cards_enabled:
+        try:
+            pipeline = CardPipeline(
+                api_key,
+                character_threshold=cards_character_threshold,
+                idle_seconds=cards_idle_seconds,
+                max_seconds=cards_max_seconds,
+            )
+            pipeline.start()
+        except Exception as error:
+            print(f"[cards] 警告: 図解保存を開始できません: {error}", file=sys.stderr)
+            pipeline = None
+        if pipeline is not None:
+            try:
+                viewer_server = ViewerServer(pipeline.json_path, cards_port)
+                viewer_server.start()
+                print(f"図解ビューア: {viewer_server.url}")
+            except OSError as error:
+                print(
+                    f"[cards] 警告: 図解ビューアを開始できません: {error}",
+                    file=sys.stderr,
+                )
+                viewer_server = None
+            else:
+                try:
+                    subprocess.run(["open", viewer_server.url], check=False)
+                except OSError as error:
+                    print(
+                        f"[cards] 警告: ブラウザを開けません: {error}",
+                        file=sys.stderr,
+                    )
 
     try:
         async with connect(
@@ -556,6 +650,16 @@ async def run_transcription(
 
                 async def finalize_text(text: str) -> None:
                     write_final(text)
+                    if pipeline is not None:
+                        try:
+                            pipeline.add(text)
+                        except Exception as error:
+                            print(
+                                f"[cards] 警告: 原文を図解へ渡せません: {error}",
+                                file=sys.stderr,
+                            )
+                    if not translate_to_ja:
+                        return
                     translated = await asyncio.to_thread(
                         translate_to_japanese, text, api_key
                     )
@@ -566,8 +670,9 @@ async def run_transcription(
                     transcript.flush()
                     print(f"[日本語訳] {translated}", flush=True)
 
+                needs_finalize = translate_to_ja or pipeline is not None
                 reducer = TranscriptReducer(
-                    (lambda _: None) if translate_to_ja else write_final
+                    (lambda _: None) if needs_finalize else write_final
                 )
                 sender = asyncio.create_task(
                     stream_audio(websocket, process, stop_event, turn_detector)
@@ -577,7 +682,7 @@ async def run_transcription(
                         websocket,
                         reducer,
                         progress_changed,
-                        finalize_text if translate_to_ja else None,
+                        finalize_text if needs_finalize else None,
                     )
                 )
                 stopper = asyncio.create_task(stop_event.wait())
@@ -627,6 +732,24 @@ async def run_transcription(
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await stop_process(process)
+        if pipeline is not None:
+            try:
+                generated_cards = await pipeline.close()
+                export_path = export_cards(generated_cards, pipeline.html_path)
+                print(f"図解HTML: {export_path}")
+            except Exception as error:
+                print(
+                    f"[cards] 警告: 図解の終了処理に失敗しました: {error}",
+                    file=sys.stderr,
+                )
+        if viewer_server is not None:
+            try:
+                viewer_server.stop()
+            except OSError as error:
+                print(
+                    f"[cards] 警告: 図解ビューアを停止できません: {error}",
+                    file=sys.stderr,
+                )
         loop.remove_signal_handler(signal.SIGINT)
 
 
@@ -658,8 +781,13 @@ def main(argv: list[str] | None = None) -> int:
                 args.device,
                 api_key,
                 ffmpeg,
-                args.silence_threshold,
-                args.translate_ja,
+                silence_rms_threshold=args.silence_threshold,
+                translate_to_ja=args.translate_ja,
+                cards_enabled=args.cards,
+                cards_port=args.cards_port,
+                cards_character_threshold=args.cards_character_threshold,
+                cards_idle_seconds=args.cards_idle_seconds,
+                cards_max_seconds=args.cards_max_seconds,
             )
         )
     except TranscriptionError as error:

@@ -5,3 +5,4 @@
 __pycache__/
 *.py[cod]
 transcripts/
+cards_output/

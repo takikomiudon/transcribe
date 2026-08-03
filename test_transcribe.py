@@ -6,7 +6,10 @@ import asyncio
 import io
 import os
 import sys
+import tempfile
 from contextlib import redirect_stderr
+from pathlib import Path
+from types import ModuleType
 from unittest.mock import patch
 
 import transcribe
@@ -55,6 +58,29 @@ def test_translation_flag() -> None:
         ["--device", "0", "--translate-ja"]
     )
     assert args.translate_ja
+
+
+def test_cards_flags() -> None:
+    args = transcribe.build_parser().parse_args(
+        [
+            "--device",
+            "0",
+            "--cards",
+            "--cards-port",
+            "9000",
+            "--cards-character-threshold",
+            "120",
+            "--cards-idle-seconds",
+            "8",
+            "--cards-max-seconds",
+            "45",
+        ]
+    )
+    assert args.cards
+    assert args.cards_port == 9000
+    assert args.cards_character_threshold == 120
+    assert args.cards_idle_seconds == 8
+    assert args.cards_max_seconds == 45
 
 
 def test_api_key_auto_load() -> None:
@@ -286,10 +312,161 @@ async def test_websocket_error_preserves_completed_output() -> None:
     assert written == ["Saved."]
 
 
+async def test_cards_receive_original_text_and_close_with_translation() -> None:
+    pipeline_instances: list[FakePipeline] = []
+    viewer_instances: list[FakeViewer] = []
+
+    class FakePipeline:
+        def __init__(self, api_key: str, **options: object) -> None:
+            self.api_key = api_key
+            self.options = options
+            self.json_path = Path("cards.json")
+            self.html_path = Path("cards.html")
+            self.texts: list[str] = []
+            self.started = False
+            self.closed = False
+            pipeline_instances.append(self)
+
+        def start(self) -> None:
+            self.started = True
+
+        def add(self, text: str) -> None:
+            self.texts.append(text)
+
+        async def close(self) -> list[object]:
+            self.closed = True
+            return []
+
+    class FakeViewer:
+        def __init__(self, cards_path: Path, port: int) -> None:
+            self.cards_path = cards_path
+            self.port = port
+            self.url = f"http://127.0.0.1:{port}"
+            self.started = False
+            self.stopped = False
+            viewer_instances.append(self)
+
+        def start(self) -> None:
+            self.started = True
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    class FakeProcess:
+        returncode = 0
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def send(self, message: str) -> None:
+            self.sent.append(message)
+
+    websocket = FakeWebSocket()
+
+    class FakeConnection:
+        async def __aenter__(self) -> FakeWebSocket:
+            return websocket
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+    def connect(*_: object, **__: object) -> FakeConnection:
+        return FakeConnection()
+
+    client_module = ModuleType("websockets.asyncio.client")
+    client_module.connect = connect  # type: ignore[attr-defined]
+    asyncio_module = ModuleType("websockets.asyncio")
+    asyncio_module.client = client_module  # type: ignore[attr-defined]
+    websockets_module = ModuleType("websockets")
+    websockets_module.asyncio = asyncio_module  # type: ignore[attr-defined]
+
+    finalized = asyncio.Event()
+
+    async def fake_stream(
+        _: object,
+        __: object,
+        stop_event: asyncio.Event,
+        ___: object,
+    ) -> None:
+        await finalized.wait()
+        stop_event.set()
+
+    async def fake_receive(
+        _: object,
+        __: object,
+        ___: asyncio.Event,
+        finalize_text: object,
+    ) -> None:
+        assert callable(finalize_text)
+        await finalize_text("Original text")
+        finalized.set()
+        await asyncio.Event().wait()
+
+    with tempfile.TemporaryDirectory() as directory:
+        transcript_path = Path(directory) / "transcript.md"
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "websockets": websockets_module,
+                    "websockets.asyncio": asyncio_module,
+                    "websockets.asyncio.client": client_module,
+                },
+            ),
+            patch("transcribe.CardPipeline", FakePipeline),
+            patch("transcribe.ViewerServer", FakeViewer),
+            patch("transcribe.export_cards") as export_cards,
+            patch("transcribe.subprocess.run") as open_browser,
+            patch(
+                "transcribe.asyncio.create_subprocess_exec",
+                return_value=FakeProcess(),
+            ),
+            patch("transcribe.stream_audio", fake_stream),
+            patch("transcribe.receive_events", fake_receive),
+            patch("transcribe.transcript_path", return_value=transcript_path),
+            patch("transcribe.translate_to_japanese", return_value="日本語訳"),
+        ):
+            result = await transcribe.run_transcription(
+                0,
+                "api-key",
+                "/usr/bin/ffmpeg",
+                translate_to_ja=True,
+                cards_enabled=True,
+                cards_port=9000,
+                cards_character_threshold=120,
+                cards_idle_seconds=8,
+                cards_max_seconds=45,
+            )
+
+        saved = transcript_path.read_text(encoding="utf-8")
+
+    assert result == transcript_path
+    assert "Original text" in saved
+    assert "日本語訳" in saved
+    pipeline = pipeline_instances[0]
+    assert pipeline.api_key == "api-key"
+    assert pipeline.options == {
+        "character_threshold": 120,
+        "idle_seconds": 8,
+        "max_seconds": 45,
+    }
+    assert pipeline.started
+    assert pipeline.texts == ["Original text"]
+    assert pipeline.closed
+    viewer = viewer_instances[0]
+    assert viewer.cards_path == pipeline.json_path
+    assert viewer.started
+    assert viewer.stopped
+    open_browser.assert_called_once_with(["open", viewer.url], check=False)
+    export_cards.assert_called_once_with([], pipeline.html_path)
+
+
 def main() -> None:
     test_model_configuration()
     test_translation_configuration_and_output()
     test_translation_flag()
+    test_cards_flags()
     test_api_key_auto_load()
     test_local_turn_detection()
     asyncio.run(test_idle_silence_is_not_uploaded())
@@ -297,6 +474,7 @@ def main() -> None:
     test_missing_key_stops_before_capture()
     asyncio.run(test_capture_eof_and_process_cleanup())
     asyncio.run(test_websocket_error_preserves_completed_output())
+    asyncio.run(test_cards_receive_original_text_and_close_with_translation())
     print("ok")
 
 
