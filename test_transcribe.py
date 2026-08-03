@@ -12,9 +12,9 @@ import tempfile
 import wave
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from urllib.parse import parse_qs, urlparse
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import transcribe
 
@@ -53,6 +53,132 @@ def test_translation_configuration_and_output() -> None:
             ]
         }
     ) == "こんにちは。"
+
+
+def test_batch_transcription_request_and_output() -> None:
+    result = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"text": "Final transcript."}),
+        stderr="",
+    )
+    with patch("transcribe.subprocess.run", return_value=result) as run:
+        text = transcribe.batch_transcribe(
+            Path("recordings/session.wav"),
+            "secret-key",
+            "/usr/bin/curl",
+        )
+
+    assert text == "Final transcript."
+    command = run.call_args.args[0]
+    assert command == [
+        "/usr/bin/curl",
+        "--silent",
+        "--show-error",
+        "--fail-with-body",
+        "--header",
+        "@-",
+        "--form",
+        "file=@recordings/session.wav;type=audio/wav",
+        "--form",
+        "model_id=scribe_v2",
+        "--form",
+        "timestamps_granularity=none",
+        "--form",
+        "tag_audio_events=false",
+        "https://api.elevenlabs.io/v1/speech-to-text",
+    ]
+    assert "secret-key" not in " ".join(command)
+    assert run.call_args.kwargs == {
+        "input": "xi-api-key: secret-key\n",
+        "capture_output": True,
+        "text": True,
+        "check": False,
+    }
+
+
+def test_batch_transcription_errors_are_user_facing() -> None:
+    for result, expected in (
+        (
+            SimpleNamespace(returncode=22, stdout="quota exceeded", stderr=""),
+            "quota exceeded",
+        ),
+        (SimpleNamespace(returncode=0, stdout="not json", stderr=""), "JSON"),
+        (
+            SimpleNamespace(returncode=0, stdout='{"language_code":"ja"}', stderr=""),
+            "text",
+        ),
+    ):
+        with patch("transcribe.subprocess.run", return_value=result):
+            try:
+                transcribe.batch_transcribe(
+                    Path("recordings/session.wav"),
+                    "secret-key",
+                    "/usr/bin/curl",
+                )
+            except transcribe.BatchTranscriptionError as error:
+                assert expected in str(error)
+            else:
+                raise AssertionError("BatchTranscriptionError was not raised")
+
+
+def test_completed_batch_is_saved_before_recording_is_deleted() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        realtime_path = Path(directory) / "20260804-120000.md"
+        audio_path = Path(directory) / "20260804-120000.wav"
+        audio_path.write_bytes(b"audio")
+        with patch(
+            "transcribe.batch_transcribe", return_value="Final transcript."
+        ):
+            final_path = transcribe.finalize_recording(
+                realtime_path,
+                audio_path,
+                "secret-key",
+                "/usr/bin/curl",
+            )
+
+        assert final_path == Path(directory) / "20260804-120000-final.md"
+        assert "Final transcript." in final_path.read_text(encoding="utf-8")
+        assert not audio_path.exists()
+
+
+def test_batch_or_save_failure_preserves_recording() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        realtime_path = Path(directory) / "20260804-120000.md"
+        audio_path = Path(directory) / "20260804-120000.wav"
+        audio_path.write_bytes(b"audio")
+        with patch(
+            "transcribe.batch_transcribe",
+            side_effect=transcribe.BatchTranscriptionError("API failed"),
+        ):
+            try:
+                transcribe.finalize_recording(
+                    realtime_path,
+                    audio_path,
+                    "secret-key",
+                    "/usr/bin/curl",
+                )
+            except transcribe.BatchTranscriptionError:
+                pass
+            else:
+                raise AssertionError("BatchTranscriptionError was not raised")
+        assert audio_path.exists()
+
+        final_path = Path(directory) / "20260804-120000-final.md"
+        final_path.write_text("existing", encoding="utf-8")
+        with patch("transcribe.batch_transcribe", return_value="Final transcript."):
+            try:
+                transcribe.finalize_recording(
+                    realtime_path,
+                    audio_path,
+                    "secret-key",
+                    "/usr/bin/curl",
+                )
+            except transcribe.BatchTranscriptionError:
+                pass
+            else:
+                raise AssertionError("BatchTranscriptionError was not raised")
+        assert audio_path.exists()
+        assert final_path.read_text(encoding="utf-8") == "existing"
 
 
 def test_transcript_header_hides_model_version() -> None:
@@ -426,15 +552,29 @@ def test_missing_key_stops_before_capture() -> None:
 
 def test_openai_key_is_only_required_for_openai_features() -> None:
     output_path = Path("transcripts/result.md")
+    audio_path = Path("recordings/result.wav")
+    final_path = Path("transcripts/result-final.md")
 
     def load_key(name: str) -> str:
         return "eleven-key" if name == "ELEVENLABS_API_KEY" else ""
 
     with (
-        patch("transcribe.shutil.which", return_value="/usr/local/bin/ffmpeg"),
+        patch(
+            "transcribe.shutil.which",
+            side_effect=lambda name: f"/usr/bin/{name}",
+        ),
         patch("transcribe.load_api_key", side_effect=load_key),
-        patch("transcribe.run_transcription", return_value="coroutine") as run_job,
-        patch("transcribe.asyncio.run", return_value=output_path) as run,
+        patch(
+            "transcribe.run_transcription",
+            new_callable=MagicMock,
+            return_value="coroutine",
+        ) as run_job,
+        patch(
+            "transcribe.asyncio.run", return_value=(output_path, audio_path)
+        ) as run,
+        patch(
+            "transcribe.finalize_recording", return_value=final_path
+        ) as finalize,
     ):
         assert transcribe.main(["--device", "0"]) == 0
     run.assert_called_once_with("coroutine")
@@ -442,7 +582,13 @@ def test_openai_key_is_only_required_for_openai_features() -> None:
         0,
         "eleven-key",
         "",
-        "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+    )
+    finalize.assert_called_once_with(
+        output_path,
+        audio_path,
+        "eleven-key",
+        "/usr/bin/curl",
     )
 
     for feature in ("--translate-ja", "--cards"):
@@ -456,6 +602,39 @@ def test_openai_key_is_only_required_for_openai_features() -> None:
             assert transcribe.main(["--device", "0", feature]) == 2
         run.assert_not_called()
         assert "OPENAI_API_KEY" in stderr.getvalue()
+
+
+def test_batch_failure_returns_error_and_reports_preserved_recording() -> None:
+    stderr = io.StringIO()
+    with tempfile.TemporaryDirectory() as directory:
+        audio_path = Path(directory) / "session.wav"
+        audio_path.write_bytes(b"audio")
+        with (
+            patch(
+                "transcribe.shutil.which",
+                side_effect=lambda name: f"/usr/bin/{name}",
+            ),
+            patch("transcribe.load_api_key", return_value="eleven-key"),
+            patch(
+                "transcribe.run_transcription",
+                new_callable=MagicMock,
+                return_value="coroutine",
+            ),
+            patch(
+                "transcribe.asyncio.run",
+                return_value=(Path("transcripts/session.md"), audio_path),
+            ),
+            patch(
+                "transcribe.finalize_recording",
+                side_effect=transcribe.BatchTranscriptionError("API failed"),
+            ),
+            redirect_stderr(stderr),
+        ):
+            assert transcribe.main(["--device", "0"]) == 1
+
+        assert audio_path.exists()
+        assert "API failed" in stderr.getvalue()
+        assert str(audio_path) in stderr.getvalue()
 
 
 async def test_capture_eof_and_process_cleanup() -> None:
@@ -764,6 +943,10 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
 def main() -> None:
     test_model_configuration()
     test_translation_configuration_and_output()
+    test_batch_transcription_request_and_output()
+    test_batch_transcription_errors_are_user_facing()
+    test_completed_batch_is_saved_before_recording_is_deleted()
+    test_batch_or_save_failure_preserves_recording()
     test_transcript_header_hides_model_version()
     test_translation_flag()
     test_cards_flags()
@@ -776,6 +959,7 @@ def main() -> None:
     asyncio.run(test_stop_commits_buffered_audio())
     test_realtime_events_and_repeated_transcripts()
     test_missing_key_stops_before_capture()
+    test_batch_failure_returns_error_and_reports_preserved_recording()
     asyncio.run(test_capture_eof_and_process_cleanup())
     asyncio.run(test_websocket_error_preserves_completed_output())
     asyncio.run(test_partial_display_and_provider_error_events())

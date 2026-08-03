@@ -41,8 +41,10 @@ from viewer import ViewerServer, export_cards
 
 
 MODEL = "scribe_v2_realtime"
+BATCH_MODEL = "scribe_v2"
 TRANSLATION_MODEL = "gpt-5.6-luna"
 WEBSOCKET_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
+BATCH_TRANSCRIPTION_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 RESPONSES_URL = "https://api.openai.com/v1/responses"
 SAMPLE_RATE = 16_000
 CHUNK_MILLISECONDS = 10
@@ -69,6 +71,10 @@ class CaptureError(TranscriptionError):
 
 class RealtimeAPIError(TranscriptionError):
     """ElevenLabs returned an error event."""
+
+
+class BatchTranscriptionError(TranscriptionError):
+    """ElevenLabs couldn't transcribe a completed recording."""
 
 
 class TranslationError(TranscriptionError):
@@ -377,6 +383,89 @@ def translation_payload(text: str) -> dict[str, Any]:
         "max_output_tokens": 1_024,
         "store": False,
     }
+
+
+def batch_transcribe(audio_path: Path, api_key: str, curl: str) -> str:
+    try:
+        result = subprocess.run(
+            [
+                curl,
+                "--silent",
+                "--show-error",
+                "--fail-with-body",
+                "--header",
+                "@-",
+                "--form",
+                f"file=@{audio_path};type=audio/wav",
+                "--form",
+                f"model_id={BATCH_MODEL}",
+                "--form",
+                "timestamps_granularity=none",
+                "--form",
+                "tag_audio_events=false",
+                BATCH_TRANSCRIPTION_URL,
+            ],
+            input=f"xi-api-key: {api_key}\n",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        raise BatchTranscriptionError(
+            f"ElevenLabs一括文字起こしとの通信に失敗しました: {error}"
+        ) from error
+    if result.returncode != 0:
+        detail = result.stdout.strip() or result.stderr.strip()
+        raise BatchTranscriptionError(
+            detail or "ElevenLabs一括文字起こしに失敗しました。"
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise BatchTranscriptionError(
+            "ElevenLabs一括文字起こしから不正なJSONを受信しました。"
+        ) from error
+    text = payload.get("text") if isinstance(payload, dict) else None
+    if not isinstance(text, str):
+        raise BatchTranscriptionError(
+            "ElevenLabs一括文字起こしの応答にtextがありません。"
+        )
+    return text.strip()
+
+
+def final_transcript_path(realtime_path: Path) -> Path:
+    return realtime_path.with_name(f"{realtime_path.stem}-final.md")
+
+
+def finalize_recording(
+    realtime_path: Path,
+    audio_path: Path,
+    api_key: str,
+    curl: str,
+) -> Path:
+    text = batch_transcribe(audio_path, api_key, curl)
+    output_path = final_transcript_path(realtime_path)
+    completed = datetime.now().astimezone().isoformat(timespec="seconds")
+    try:
+        with output_path.open("x", encoding="utf-8") as transcript:
+            transcript.write(
+                "# Final Transcript\n\n"
+                f"- Completed: {completed}\n"
+                "- Model: `ElevenLabs Scribe v2`\n\n"
+                "## Transcript\n\n"
+                f"{text}\n"
+            )
+    except OSError as error:
+        raise BatchTranscriptionError(
+            f"最終文字起こしを保存できませんでした: {error}"
+        ) from error
+    try:
+        audio_path.unlink()
+    except OSError as error:
+        raise BatchTranscriptionError(
+            f"録音を削除できませんでした: {error}"
+        ) from error
+    return output_path
 
 
 def response_output_text(response: dict[str, Any]) -> str:
@@ -790,6 +879,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_devices:
         return list_audio_devices(ffmpeg)
 
+    curl = shutil.which("curl")
+    if curl is None:
+        print("curlが見つかりません。", file=sys.stderr)
+        return 2
+
     try:
         elevenlabs_api_key = load_api_key("ELEVENLABS_API_KEY")
         needs_openai = args.translate_ja or args.cards
@@ -810,8 +904,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    audio_path: Path | None = None
     try:
-        output_path = asyncio.run(
+        output_path, audio_path = asyncio.run(
             run_transcription(
                 args.device,
                 elevenlabs_api_key,
@@ -826,11 +921,21 @@ def main(argv: list[str] | None = None) -> int:
                 cards_max_seconds=args.cards_max_seconds,
             )
         )
+        print("ElevenLabsで最終文字起こし中です...")
+        final_path = finalize_recording(
+            output_path,
+            audio_path,
+            elevenlabs_api_key,
+            curl,
+        )
     except TranscriptionError as error:
         print(f"エラー: {error}", file=sys.stderr)
+        if audio_path is not None and audio_path.exists():
+            print(f"録音を保持しました: {audio_path}", file=sys.stderr)
         return 1
 
-    print(f"保存しました: {output_path}")
+    print(f"リアルタイム記録: {output_path}")
+    print(f"最終文字起こし: {final_path}")
     return 0
 
 
