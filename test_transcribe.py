@@ -9,7 +9,7 @@ import json
 import os
 import sys
 import tempfile
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import ModuleType
 from urllib.parse import parse_qs, urlparse
@@ -96,8 +96,8 @@ def test_api_key_auto_load() -> None:
             ),
         ),
     ):
-        assert transcribe.load_elevenlabs_api_key() == "eleven-from-file"
-        assert transcribe.load_openai_api_key() == "openai-from-file"
+        assert transcribe.load_api_key("ELEVENLABS_API_KEY") == "eleven-from-file"
+        assert transcribe.load_api_key("OPENAI_API_KEY") == "openai-from-file"
 
     with (
         patch.dict(
@@ -110,8 +110,8 @@ def test_api_key_auto_load() -> None:
         ),
         patch.object(transcribe.Path, "read_text") as read_text,
     ):
-        assert transcribe.load_elevenlabs_api_key() == "eleven-from-env"
-        assert transcribe.load_openai_api_key() == "openai-from-env"
+        assert transcribe.load_api_key("ELEVENLABS_API_KEY") == "eleven-from-env"
+        assert transcribe.load_api_key("OPENAI_API_KEY") == "openai-from-env"
         read_text.assert_not_called()
 
 
@@ -337,13 +337,47 @@ def test_missing_key_stops_before_capture() -> None:
     with (
         patch.dict(os.environ, {}, clear=True),
         patch("transcribe.shutil.which", return_value="/usr/local/bin/ffmpeg"),
-        patch("transcribe.load_elevenlabs_api_key", return_value=""),
+        patch("transcribe.load_api_key", return_value=""),
         patch("transcribe.asyncio.run") as run,
         redirect_stderr(stderr),
     ):
         assert transcribe.main(["--device", "0"]) == 2
     run.assert_not_called()
     assert "ELEVENLABS_API_KEY" in stderr.getvalue()
+
+
+def test_openai_key_is_only_required_for_openai_features() -> None:
+    output_path = Path("transcripts/result.md")
+
+    def load_key(name: str) -> str:
+        return "eleven-key" if name == "ELEVENLABS_API_KEY" else ""
+
+    with (
+        patch("transcribe.shutil.which", return_value="/usr/local/bin/ffmpeg"),
+        patch("transcribe.load_api_key", side_effect=load_key),
+        patch("transcribe.run_transcription", return_value="coroutine") as run_job,
+        patch("transcribe.asyncio.run", return_value=output_path) as run,
+    ):
+        assert transcribe.main(["--device", "0"]) == 0
+    run.assert_called_once_with("coroutine")
+    assert run_job.call_args.args[:4] == (
+        0,
+        "eleven-key",
+        "",
+        "/usr/local/bin/ffmpeg",
+    )
+
+    for feature in ("--translate-ja", "--cards"):
+        stderr = io.StringIO()
+        with (
+            patch("transcribe.shutil.which", return_value="/usr/local/bin/ffmpeg"),
+            patch("transcribe.load_api_key", side_effect=load_key),
+            patch("transcribe.asyncio.run") as run,
+            redirect_stderr(stderr),
+        ):
+            assert transcribe.main(["--device", "0", feature]) == 2
+        run.assert_not_called()
+        assert "OPENAI_API_KEY" in stderr.getvalue()
 
 
 async def test_capture_eof_and_process_cleanup() -> None:
@@ -411,6 +445,68 @@ async def test_websocket_error_preserves_completed_output() -> None:
     else:
         raise AssertionError("RealtimeAPIError was not raised")
     assert written == ["Saved."]
+
+
+async def test_partial_display_and_provider_error_events() -> None:
+    class FakeWebSocket:
+        def __init__(self, messages: list[str]) -> None:
+            self.source = messages
+
+        def __aiter__(self):
+            self.messages = iter(self.source)
+            return self
+
+        async def __anext__(self) -> str:
+            try:
+                return next(self.messages)
+            except StopIteration as error:
+                raise StopAsyncIteration from error
+
+    written: list[str] = []
+    output = io.StringIO()
+    reducer = transcribe.TranscriptReducer(written.append)
+    with redirect_stdout(output):
+        try:
+            await transcribe.receive_events(
+                FakeWebSocket(
+                    [
+                        '{"message_type":"partial_transcript","text":"Hel"}',
+                        '{"message_type":"committed_transcript","text":"Hello"}',
+                    ]
+                ),
+                reducer,
+                asyncio.Event(),
+            )
+        except transcribe.TranscriptionError:
+            pass
+        else:
+            raise AssertionError("TranscriptionError was not raised")
+    assert output.getvalue() == "\r\033[2KHel\r\033[2KHello\n"
+    assert written == ["Hello"]
+
+    for event_type in (
+        "auth_error",
+        "quota_exceeded",
+        "unaccepted_terms",
+        "rate_limited",
+        "input_error",
+    ):
+        try:
+            await transcribe.receive_events(
+                FakeWebSocket(
+                    [
+                        json.dumps(
+                            {"message_type": event_type, "error": event_type}
+                        )
+                    ]
+                ),
+                transcribe.TranscriptReducer(lambda _: None),
+                asyncio.Event(),
+            )
+        except transcribe.RealtimeAPIError as error:
+            assert str(error) == event_type
+        else:
+            raise AssertionError(f"{event_type} was not raised")
 
 
 async def test_cards_receive_original_text_and_close_with_translation() -> None:
@@ -588,6 +684,7 @@ def main() -> None:
     test_missing_key_stops_before_capture()
     asyncio.run(test_capture_eof_and_process_cleanup())
     asyncio.run(test_websocket_error_preserves_completed_output())
+    asyncio.run(test_partial_display_and_provider_error_events())
     asyncio.run(test_cards_receive_original_text_and_close_with_translation())
     print("ok")
 

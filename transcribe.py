@@ -244,8 +244,8 @@ def port_number(value: str) -> int:
     return number
 
 
-def load_elevenlabs_api_key(env_file: Path = ENV_FILE) -> str:
-    api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+def load_api_key(name: str, env_file: Path = ENV_FILE) -> str:
+    api_key = os.environ.get(name, "").strip()
     if api_key:
         return api_key
     try:
@@ -256,29 +256,8 @@ def load_elevenlabs_api_key(env_file: Path = ENV_FILE) -> str:
         line = line.strip()
         if line.startswith("export "):
             line = line.removeprefix("export ").lstrip()
-        name, separator, value = line.partition("=")
-        if separator and name.strip() == "ELEVENLABS_API_KEY":
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                value = value[1:-1]
-            return value.strip()
-    return ""
-
-
-def load_openai_api_key(env_file: Path = ENV_FILE) -> str:
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if api_key:
-        return api_key
-    try:
-        lines = env_file.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return ""
-    for line in lines:
-        line = line.strip()
-        if line.startswith("export "):
-            line = line.removeprefix("export ").lstrip()
-        name, separator, value = line.partition("=")
-        if separator and name.strip() == "OPENAI_API_KEY":
+        variable, separator, value = line.partition("=")
+        if separator and variable.strip() == name:
             value = value.strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
                 value = value[1:-1]
@@ -779,8 +758,9 @@ def main(argv: list[str] | None = None) -> int:
         return list_audio_devices(ffmpeg)
 
     try:
-        elevenlabs_api_key = load_elevenlabs_api_key()
-        openai_api_key = load_openai_api_key()
+        elevenlabs_api_key = load_api_key("ELEVENLABS_API_KEY")
+        needs_openai = args.translate_ja or args.cards
+        openai_api_key = load_api_key("OPENAI_API_KEY") if needs_openai else ""
     except OSError as error:
         print(f".env.localを読み込めませんでした: {error}", file=sys.stderr)
         return 2
@@ -790,7 +770,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    if not openai_api_key:
+    if needs_openai and not openai_api_key:
         print(
             "OPENAI_API_KEYが環境変数または.env.localに設定されていません。",
             file=sys.stderr,
