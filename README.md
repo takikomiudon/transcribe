@@ -1,12 +1,13 @@
 # Minimal Realtime Transcription CLI
 
-macOSの日本語・英語・韓国語音声をElevenLabs Scribe Realtimeでリアルタイム文字起こしし、確定した文章をMarkdownへ保存する最小CLIです。日本語を主言語、英語・韓国語を副言語として認識します。
+macOSの日本語・英語・韓国語音声をElevenLabs Scribe Realtimeでリアルタイム文字起こしし、終了後にセッション全体をElevenLabs Scribe v2でも一括文字起こしする最小CLIです。日本語を主言語、英語・韓国語を副言語として認識します。
 
 ## 必要なもの
 
 - macOS
 - `uv`
 - `ffmpeg`
+- `curl`（macOS標準）
 - `ELEVENLABS_API_KEY` を設定した `.env.local`
 - 翻訳または図解を使う場合のみ `OPENAI_API_KEY`
 
@@ -47,6 +48,8 @@ uv run transcribe.py --device 0
 
 途中結果はターミナルへ表示され、確定結果は `transcripts/YYYYMMDD-HHMMSS.md` へ逐次保存されます。終了は `Ctrl-C` です。
 
+処理中は開始から終了までの全音声を `recordings/YYYYMMDD-HHMMSS.wav` へ保存します。終了後、このWAVをElevenLabs Scribe v2へ送り、精度重視の結果を `transcripts/YYYYMMDD-HHMMSS-final.md` へ保存します。最終Markdownの保存に成功するとWAVは自動で削除され、API通信や保存に失敗した場合は再試行できるよう残ります。リアルタイム処理と終了後の一括処理はそれぞれElevenLabsの利用料金が発生します。
+
 英語・韓国語の確定結果を日本語でも保存する場合は、`--translate-ja` を追加します。原文の文字起こしにはElevenLabs Scribe Realtime、日本語訳にはOpenAI `gpt-5.6-luna` を使用するため、翻訳分のAPI料金が別途かかります。
 
 ```sh
@@ -69,7 +72,7 @@ uv run transcribe.py --device 0 --cards
 
 システム音声を入力として扱うには、BlackHoleを別途インストールし、「Audio MIDI設定」で通常の出力先とBlackHoleを含む複数出力装置を作成します。その後、`--list-devices` に表示されるBlackHoleの番号を指定します。
 
-この最小版は入力を1つだけ扱います。マイクとの同時ミックス、話者分離、音声保存、自動再接続は行いません。
+この最小版は入力を1つだけ扱います。マイクとの同時ミックス、話者分離、自動再接続は行いません。
 
 ## Raycastから起動
 
