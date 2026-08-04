@@ -48,13 +48,7 @@ uv run transcribe.py --device 0
 
 途中結果とRealtimeの確定行は速報性を優先して生のままターミナルへ表示されます。確定結果は直前500文字の文脈とbatch版から収穫した用語集を使ってOpenAIで補正され、`transcripts/YYYYMMDD-HHMMSS.md` へ受信順に保存されます。ブラウザにはScribe v2による精度重視の全文が表示され、最初の30秒と、録音量が前回の全文更新時の1.5倍に達した時点で更新されます。終了は `Ctrl-C` です。
 
-補正を使わず従来どおりRealtimeの確定結果をそのまま保存する場合は、`--no-correction` を追加します。`--translate-ja` と `--cards` も使わない場合、このモードでは `OPENAI_API_KEY` は不要です。
-
-```sh
-uv run transcribe.py --device 0 --no-correction
-```
-
-処理中は開始から終了までの全音声を `recordings/YYYYMMDD-HHMMSS.wav` へ保存します。最初の30秒と、録音フレーム数が前回の全文転写時の1.5倍に達した時点で蓄積WAVをElevenLabs Scribe v2へ送り、精度重視の結果で `transcripts/YYYYMMDD-HHMMSS-final.md` を書き直します。それ以外の30秒tickでは、補正用語集の更新に必要な末尾60秒だけを転写し、final本文には使いません。補正を無効にした場合、この末尾転写も行いません。停止時には全WAVで最終更新し、保存に成功するとWAVは自動で削除されます。API通信や保存に失敗した場合は、直前のfinalと再試行用WAVが残ります。
+処理中は開始から終了までの全音声を `recordings/YYYYMMDD-HHMMSS.wav` へ保存します。最初の30秒と、録音フレーム数が前回の全文転写時の1.5倍に達した時点で蓄積WAVをElevenLabs Scribe v2へ送り、精度重視の結果で `transcripts/YYYYMMDD-HHMMSS-final.md` を書き直します。それ以外の30秒tickでは、補正用語集の更新に必要な末尾60秒だけを転写し、final本文には使いません。停止時には全WAVで最終更新し、保存に成功するとWAVは自動で削除されます。API通信や保存に失敗した場合は、直前のfinalと再試行用WAVが残ります。
 
 判定間隔は `--batch-refresh-seconds 60` のように変更できます。用語集用の末尾ウィンドウは60秒または判定間隔の2倍の長い方です。既定値では、用語集用転写が録音時間の約2倍、成長比率による全文転写が合計約3倍、停止時の最終更新が1倍となり、batch処理量は最大約6倍を目安に線形に増えます。全文更新tickでは末尾転写を省くため、実際の処理量はこれより少なくなります。Realtime、各batch転写、停止時の最終更新にはそれぞれElevenLabsの利用料金が発生します。
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import inspect
 import json
 import os
 import sys
@@ -731,11 +732,20 @@ def test_translation_flag() -> None:
         ["--device", "0", "--translate-ja"]
     )
     assert args.translate_ja
-    assert not args.no_correction
+    assert "no_correction" not in vars(args)
     assert "silence_threshold" not in vars(args)
 
-    args = transcribe.build_parser().parse_args(["--device", "0", "--no-correction"])
-    assert args.no_correction
+    with redirect_stderr(io.StringIO()):
+        try:
+            transcribe.build_parser().parse_args(["--device", "0", "--no-correction"])
+        except SystemExit as error:
+            assert error.code == 2
+        else:
+            raise AssertionError("--no-correction must be rejected")
+
+    assert "correction_enabled" not in inspect.signature(
+        transcribe.run_transcription
+    ).parameters
 
 
 def test_cards_flags() -> None:
@@ -877,70 +887,20 @@ def test_missing_key_stops_before_capture() -> None:
     assert "ELEVENLABS_API_KEY" in stderr.getvalue()
 
 
-def test_openai_key_is_required_unless_correction_is_disabled() -> None:
-    output_path = Path("transcripts/result.md")
-    audio_path = Path("recordings/result.wav")
-    final_path = Path("transcripts/result-final.md")
-
+def test_openai_key_is_always_required() -> None:
     def load_key(name: str) -> str:
         return "eleven-key" if name == "ELEVENLABS_API_KEY" else ""
 
+    stderr = io.StringIO()
     with (
-        patch(
-            "transcribe.shutil.which",
-            side_effect=lambda name: f"/usr/bin/{name}",
-        ),
+        patch("transcribe.shutil.which", return_value="/usr/local/bin/ffmpeg"),
         patch("transcribe.load_api_key", side_effect=load_key),
-        patch(
-            "transcribe.run_transcription",
-            new_callable=MagicMock,
-            return_value="coroutine",
-        ) as run_job,
-        patch(
-            "transcribe.asyncio.run",
-            return_value=(output_path, audio_path, None, None, None),
-        ) as run,
-        patch(
-            "transcribe.finalize_recording",
-            return_value=(final_path, "Final transcript."),
-        ) as finalize,
+        patch("transcribe.asyncio.run") as run,
+        redirect_stderr(stderr),
     ):
-        assert transcribe.main(["--device", "0", "--no-correction"]) == 0
-    run.assert_called_once_with("coroutine")
-    assert run_job.call_args.args[:4] == (
-        0,
-        "eleven-key",
-        "",
-        "/usr/bin/ffmpeg",
-    )
-    assert run_job.call_args.kwargs["curl"] == "/usr/bin/curl"
-    assert (
-        run_job.call_args.kwargs["batch_refresh_seconds"]
-        == transcribe.BATCH_REFRESH_SECONDS
-    )
-    assert run_job.call_args.kwargs["correction_enabled"] is False
-    finalize.assert_called_once_with(
-        output_path,
-        audio_path,
-        "eleven-key",
-        "/usr/bin/curl",
-    )
-
-    for options in (
-        [],
-        ["--no-correction", "--translate-ja"],
-        ["--no-correction", "--cards"],
-    ):
-        stderr = io.StringIO()
-        with (
-            patch("transcribe.shutil.which", return_value="/usr/local/bin/ffmpeg"),
-            patch("transcribe.load_api_key", side_effect=load_key),
-            patch("transcribe.asyncio.run") as run,
-            redirect_stderr(stderr),
-        ):
-            assert transcribe.main(["--device", "0", *options]) == 2
-        run.assert_not_called()
-        assert "OPENAI_API_KEY" in stderr.getvalue()
+        assert transcribe.main(["--device", "0"]) == 2
+    run.assert_not_called()
+    assert "OPENAI_API_KEY" in stderr.getvalue()
 
 
 def test_batch_failure_returns_error_and_reports_preserved_recording() -> None:
@@ -1205,7 +1165,7 @@ async def test_partial_display_and_provider_error_events() -> None:
             raise AssertionError(f"{event_type} was not raised")
 
 
-async def test_corrected_text_reaches_all_outputs_and_can_be_disabled() -> None:
+async def test_corrected_text_reaches_all_outputs() -> None:
     pipeline_instances: list[FakePipeline] = []
     viewer_instances: list[FakeViewer] = []
 
@@ -1315,8 +1275,6 @@ async def test_corrected_text_reaches_all_outputs_and_can_be_disabled() -> None:
     with tempfile.TemporaryDirectory() as directory:
         transcript_path = Path(directory) / "transcript.md"
         recording_path = Path(directory) / "recording.wav"
-        raw_transcript_path = Path(directory) / "raw-transcript.md"
-        raw_recording_path = Path(directory) / "raw-recording.wav"
         with (
             patch.dict(
                 sys.modules,
@@ -1338,11 +1296,11 @@ async def test_corrected_text_reaches_all_outputs_and_can_be_disabled() -> None:
             patch("transcribe.receive_events", fake_receive),
             patch(
                 "transcribe.transcript_path",
-                side_effect=[transcript_path, raw_transcript_path],
+                return_value=transcript_path,
             ),
             patch(
                 "transcribe.recording_path",
-                side_effect=[recording_path, raw_recording_path],
+                return_value=recording_path,
             ),
             patch(
                 "transcribe.correct_transcript", return_value="Corrected text"
@@ -1363,17 +1321,8 @@ async def test_corrected_text_reaches_all_outputs_and_can_be_disabled() -> None:
                 cards_idle_seconds=8,
                 cards_max_seconds=45,
             )
-            finalized = asyncio.Event()
-            raw_result = await transcribe.run_transcription(
-                0,
-                "eleven-key",
-                "",
-                "/usr/bin/ffmpeg",
-                correction_enabled=False,
-            )
 
         saved = transcript_path.read_text(encoding="utf-8")
-        raw_saved = raw_transcript_path.read_text(encoding="utf-8")
         with wave.open(str(recording_path), "rb") as recording:
             assert recording.getnchannels() == 1
             assert recording.getsampwidth() == 2
@@ -1389,16 +1338,8 @@ async def test_corrected_text_reaches_all_outputs_and_can_be_disabled() -> None:
         pipeline_instances[0].html_path,
         viewer_instances[0],
     )
-    assert raw_result == (
-        raw_transcript_path,
-        raw_recording_path,
-        None,
-        None,
-        viewer_instances[1],
-    )
     assert "Corrected text" in saved
     assert "Original text" not in saved
-    assert "Original text" in raw_saved
     assert "日本語訳" in saved
     assert connect_calls[0][0] == (transcribe.realtime_url(),)
     assert connect_calls[0][1]["additional_headers"] == {
@@ -1423,7 +1364,7 @@ async def test_corrected_text_reaches_all_outputs_and_can_be_disabled() -> None:
     assert viewer.cards_path == pipeline.json_path
     assert viewer.started
     assert not viewer.stopped
-    assert open_browser.call_count == 2
+    open_browser.assert_called_once_with(["open", viewer.url], check=False)
     export_cards.assert_called_once_with([], pipeline.html_path)
 
 
@@ -1452,12 +1393,13 @@ def main() -> None:
     asyncio.run(test_all_audio_is_streamed_in_batches_and_committed_on_stop())
     test_realtime_events_and_repeated_transcripts()
     test_missing_key_stops_before_capture()
+    test_openai_key_is_always_required()
     test_batch_failure_returns_error_and_reports_preserved_recording()
     test_final_cards_replace_live_artifacts_only_on_success()
     asyncio.run(test_capture_eof_and_process_cleanup())
     asyncio.run(test_websocket_error_preserves_completed_output())
     asyncio.run(test_partial_display_and_provider_error_events())
-    asyncio.run(test_corrected_text_reaches_all_outputs_and_can_be_disabled())
+    asyncio.run(test_corrected_text_reaches_all_outputs())
     print("ok")
 
 

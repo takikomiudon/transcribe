@@ -139,11 +139,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="確定した英語・韓国語を日本語へ翻訳",
     )
     parser.add_argument(
-        "--no-correction",
-        action="store_true",
-        help="Realtime確定結果のLLM補正を無効化",
-    )
-    parser.add_argument(
         "--cards",
         action="store_true",
         help="確定した発話から図解カードを生成",
@@ -865,7 +860,6 @@ async def run_transcription(
     ffmpeg: str,
     curl: str = "curl",
     batch_refresh_seconds: float = BATCH_REFRESH_SECONDS,
-    correction_enabled: bool = True,
     translate_to_ja: bool = False,
     cards_enabled: bool = False,
     cards_port: int = 8765,
@@ -961,7 +955,7 @@ async def run_transcription(
                         curl,
                         stop_event,
                         interval_seconds=batch_refresh_seconds,
-                        glossary=glossary if correction_enabled else None,
+                        glossary=glossary,
                         openai_api_key=openai_api_key,
                     )
                 )
@@ -993,27 +987,20 @@ async def run_transcription(
                     print(f"[日本語訳] {translated}", flush=True)
 
                 correction_queue: asyncio.Queue[str | None] = asyncio.Queue()
-                correction_task: asyncio.Task[None] | None = None
 
                 async def enqueue_correction(text: str) -> None:
                     correction_queue.put_nowait(text)
 
-                if correction_enabled:
-                    correction_task = asyncio.create_task(
-                        process_corrections(
-                            correction_queue,
-                            glossary,
-                            openai_api_key,
-                            finalize_text,
-                        )
+                correction_task = asyncio.create_task(
+                    process_corrections(
+                        correction_queue,
+                        glossary,
+                        openai_api_key,
+                        finalize_text,
                     )
+                )
 
-                needs_finalize = (
-                    correction_enabled or translate_to_ja or pipeline is not None
-                )
-                reducer = TranscriptReducer(
-                    (lambda _: None) if needs_finalize else write_final
-                )
+                reducer = TranscriptReducer(lambda _: None)
                 sender = asyncio.create_task(
                     stream_audio(
                         websocket,
@@ -1027,11 +1014,7 @@ async def run_transcription(
                         websocket,
                         reducer,
                         progress_changed,
-                        (
-                            enqueue_correction
-                            if correction_enabled
-                            else finalize_text if needs_finalize else None
-                        ),
+                        enqueue_correction,
                     )
                 )
                 stopper = asyncio.create_task(stop_event.wait())
@@ -1065,13 +1048,12 @@ async def run_transcription(
                     else:
                         receiver.result()
                 finally:
-                    if correction_task is not None:
-                        if not receiver.done():
-                            receiver.cancel()
-                            await asyncio.gather(receiver, return_exceptions=True)
-                        await correction_queue.join()
-                        correction_queue.put_nowait(None)
-                        await correction_task
+                    if not receiver.done():
+                        receiver.cancel()
+                        await asyncio.gather(receiver, return_exceptions=True)
+                    await correction_queue.join()
+                    correction_queue.put_nowait(None)
+                    await correction_task
 
                 await refresh_task
 
@@ -1139,8 +1121,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         elevenlabs_api_key = load_api_key("ELEVENLABS_API_KEY")
-        needs_openai = not args.no_correction or args.translate_ja or args.cards
-        openai_api_key = load_api_key("OPENAI_API_KEY") if needs_openai else ""
+        openai_api_key = load_api_key("OPENAI_API_KEY")
     except OSError as error:
         print(f".env.localを読み込めませんでした: {error}", file=sys.stderr)
         return 2
@@ -1150,7 +1131,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    if needs_openai and not openai_api_key:
+    if not openai_api_key:
         print(
             "OPENAI_API_KEYが環境変数または.env.localに設定されていません。",
             file=sys.stderr,
@@ -1174,7 +1155,6 @@ def main(argv: list[str] | None = None) -> int:
                 ffmpeg,
                 curl=curl,
                 batch_refresh_seconds=args.batch_refresh_seconds,
-                correction_enabled=not args.no_correction,
                 translate_to_ja=args.translate_ja,
                 cards_enabled=args.cards,
                 cards_port=args.cards_port,
