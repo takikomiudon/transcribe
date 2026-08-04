@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import wave
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -122,6 +123,119 @@ def test_batch_transcription_errors_are_user_facing() -> None:
                 raise AssertionError("BatchTranscriptionError was not raised")
 
 
+def test_recording_snapshot_is_a_complete_wav() -> None:
+    first = bytes(transcribe.CHUNK_BYTES)
+    second = bytes([1]) * transcribe.CHUNK_BYTES
+    with tempfile.TemporaryDirectory() as directory:
+        audio_path = Path(directory) / "recording.wav"
+        with (
+            audio_path.open("xb") as audio_file,
+            wave.open(audio_file, "wb") as recording,
+        ):
+            recording.setnchannels(1)
+            recording.setsampwidth(2)
+            recording.setframerate(transcribe.SAMPLE_RATE)
+            recording.writeframesraw(first)
+            recording.writeframesraw(second)
+            snapshot = transcribe.snapshot_recording(
+                recording, audio_file, audio_path
+            )
+
+            with wave.open(str(snapshot), "rb") as saved:
+                assert saved.getnchannels() == 1
+                assert saved.getsampwidth() == 2
+                assert saved.getframerate() == transcribe.SAMPLE_RATE
+                assert saved.readframes(saved.getnframes()) == first + second
+
+            snapshot.unlink()
+
+
+async def test_periodic_batch_refresh_retries_without_overlap() -> None:
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    active = 0
+    maximum_active = 0
+    attempts = 0
+    snapshots: list[Path] = []
+
+    def make_snapshot(*_: object) -> Path:
+        temporary = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        temporary.close()
+        snapshot = Path(temporary.name)
+        snapshots.append(snapshot)
+        return snapshot
+
+    def transcribe_snapshot(*_: object) -> str:
+        nonlocal active, attempts, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        attempts += 1
+        time.sleep(0.02)
+        active -= 1
+        if attempts == 1:
+            raise transcribe.BatchTranscriptionError("temporary failure")
+        loop.call_soon_threadsafe(stop_event.set)
+        return "Updated transcript."
+
+    with tempfile.TemporaryDirectory() as directory:
+        realtime_path = Path(directory) / "session.md"
+        with (
+            patch("transcribe.snapshot_recording", side_effect=make_snapshot),
+            patch("transcribe.batch_transcribe", side_effect=transcribe_snapshot),
+        ):
+            await transcribe.periodically_refresh_final(
+                realtime_path,
+                Path("recording.wav"),
+                object(),
+                object(),
+                "secret-key",
+                "/usr/bin/curl",
+                stop_event,
+                interval_seconds=0.01,
+            )
+
+        final_path = transcribe.final_transcript_path(realtime_path)
+        assert "Updated transcript." in final_path.read_text(encoding="utf-8")
+
+    assert attempts == 2
+    assert maximum_active == 1
+    assert all(not snapshot.exists() for snapshot in snapshots)
+
+
+async def test_periodic_batch_failure_keeps_previous_final() -> None:
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    temporary = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    temporary.close()
+    snapshot = Path(temporary.name)
+
+    def fail(*_: object) -> str:
+        loop.call_soon_threadsafe(stop_event.set)
+        raise transcribe.BatchTranscriptionError("temporary failure")
+
+    with tempfile.TemporaryDirectory() as directory:
+        realtime_path = Path(directory) / "session.md"
+        final_path = transcribe.final_transcript_path(realtime_path)
+        final_path.write_text("previous checkpoint", encoding="utf-8")
+        with (
+            patch("transcribe.snapshot_recording", return_value=snapshot),
+            patch("transcribe.batch_transcribe", side_effect=fail),
+        ):
+            await transcribe.periodically_refresh_final(
+                realtime_path,
+                Path("recording.wav"),
+                object(),
+                object(),
+                "secret-key",
+                "/usr/bin/curl",
+                stop_event,
+                interval_seconds=0.01,
+            )
+
+        assert final_path.read_text(encoding="utf-8") == "previous checkpoint"
+    assert not snapshot.exists()
+
+
 def test_completed_batch_is_saved_before_recording_is_deleted() -> None:
     with tempfile.TemporaryDirectory() as directory:
         realtime_path = Path(directory) / "20260804-120000.md"
@@ -166,7 +280,13 @@ def test_batch_or_save_failure_preserves_recording() -> None:
 
         final_path = Path(directory) / "20260804-120000-final.md"
         final_path.write_text("existing", encoding="utf-8")
-        with patch("transcribe.batch_transcribe", return_value="Final transcript."):
+        with (
+            patch("transcribe.batch_transcribe", return_value="Final transcript."),
+            patch(
+                "transcribe.Path.replace",
+                side_effect=OSError("disk failed"),
+            ),
+        ):
             try:
                 transcribe.finalize_recording(
                     realtime_path,
@@ -180,6 +300,28 @@ def test_batch_or_save_failure_preserves_recording() -> None:
                 raise AssertionError("BatchTranscriptionError was not raised")
         assert audio_path.exists()
         assert final_path.read_text(encoding="utf-8") == "existing"
+
+
+def test_final_transcript_replaces_previous_checkpoint() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        realtime_path = Path(directory) / "20260804-120000.md"
+        audio_path = Path(directory) / "20260804-120000.wav"
+        final_path = Path(directory) / "20260804-120000-final.md"
+        audio_path.write_bytes(b"audio")
+        final_path.write_text("old checkpoint", encoding="utf-8")
+        with patch(
+            "transcribe.batch_transcribe", return_value="Complete transcript."
+        ):
+            transcribe.finalize_recording(
+                realtime_path,
+                audio_path,
+                "secret-key",
+                "/usr/bin/curl",
+            )
+
+        assert "Complete transcript." in final_path.read_text(encoding="utf-8")
+        assert "old checkpoint" not in final_path.read_text(encoding="utf-8")
+        assert not audio_path.exists()
 
 
 def test_transcript_header_hides_model_version() -> None:
@@ -219,6 +361,12 @@ def test_cards_flags() -> None:
     assert args.cards_character_threshold == 120
     assert args.cards_idle_seconds == 8
     assert args.cards_max_seconds == 45
+    assert args.batch_refresh_seconds == transcribe.BATCH_REFRESH_SECONDS
+
+    args = transcribe.build_parser().parse_args(
+        ["--device", "0", "--batch-refresh-seconds", "60"]
+    )
+    assert args.batch_refresh_seconds == 60
 
 
 def test_api_key_auto_load() -> None:
@@ -364,6 +512,11 @@ def test_openai_key_is_only_required_for_openai_features() -> None:
         "eleven-key",
         "",
         "/usr/bin/ffmpeg",
+    )
+    assert run_job.call_args.kwargs["curl"] == "/usr/bin/curl"
+    assert (
+        run_job.call_args.kwargs["batch_refresh_seconds"]
+        == transcribe.BATCH_REFRESH_SECONDS
     )
     finalize.assert_called_once_with(
         output_path,
@@ -725,8 +878,12 @@ def main() -> None:
     test_translation_configuration_and_output()
     test_batch_transcription_request_and_output()
     test_batch_transcription_errors_are_user_facing()
+    test_recording_snapshot_is_a_complete_wav()
+    asyncio.run(test_periodic_batch_refresh_retries_without_overlap())
+    asyncio.run(test_periodic_batch_failure_keeps_previous_final())
     test_completed_batch_is_saved_before_recording_is_deleted()
     test_batch_or_save_failure_preserves_recording()
+    test_final_transcript_replaces_previous_checkpoint()
     test_transcript_header_hides_model_version()
     test_translation_flag()
     test_cards_flags()

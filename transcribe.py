@@ -19,6 +19,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -50,6 +51,7 @@ CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MILLISECONDS // 1_000
 UPLOAD_CHUNK_MILLISECONDS = 100
 UPLOAD_CHUNK_BYTES = SAMPLE_RATE * 2 * UPLOAD_CHUNK_MILLISECONDS // 1_000
 FINAL_WAIT_SECONDS = 5
+BATCH_REFRESH_SECONDS = 30
 TRANSLATION_TIMEOUT_SECONDS = 20
 ENV_FILE = Path(".env.local")
 
@@ -116,6 +118,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mode.add_argument(
         "--device", type=non_negative_integer, metavar="INDEX", help="音声入力番号"
+    )
+    parser.add_argument(
+        "--batch-refresh-seconds",
+        type=positive_integer,
+        default=BATCH_REFRESH_SECONDS,
+        metavar="SECONDS",
+        help=f"Scribe v2でfinalを更新する間隔（既定: {BATCH_REFRESH_SECONDS}）",
     )
     parser.add_argument(
         "--translate-ja",
@@ -364,8 +373,98 @@ def batch_transcribe(audio_path: Path, api_key: str, curl: str) -> str:
     return text.strip()
 
 
+def snapshot_recording(recording: Any, audio_file: Any, audio_path: Path) -> Path:
+    """Copy the complete frames written so far into a valid temporary WAV."""
+    snapshot: Path | None = None
+    try:
+        recording.writeframes(b"")
+        audio_file.flush()
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
+            snapshot = Path(temporary.name)
+        shutil.copyfile(audio_path, snapshot)
+    except OSError as error:
+        if snapshot is not None:
+            try:
+                snapshot.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise BatchTranscriptionError(
+            f"録音中のWAVスナップショットを作成できませんでした: {error}"
+        ) from error
+    return snapshot
+
+
 def final_transcript_path(realtime_path: Path) -> Path:
     return realtime_path.with_name(f"{realtime_path.stem}-final.md")
+
+
+def write_batch_transcript(realtime_path: Path, text: str) -> Path:
+    output_path = final_transcript_path(realtime_path)
+    temporary = output_path.with_suffix(f"{output_path.suffix}.tmp")
+    completed = datetime.now().astimezone().isoformat(timespec="seconds")
+    try:
+        temporary.write_text(
+            "# Final Transcript\n\n"
+            f"- Completed: {completed}\n"
+            "- Model: `ElevenLabs Scribe v2`\n\n"
+            "## Transcript\n\n"
+            f"{text}\n",
+            encoding="utf-8",
+        )
+        temporary.replace(output_path)
+    except OSError as error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise BatchTranscriptionError(
+            f"最終文字起こしを保存できませんでした: {error}"
+        ) from error
+    return output_path
+
+
+async def periodically_refresh_final(
+    realtime_path: Path,
+    audio_path: Path,
+    recording: Any,
+    audio_file: Any,
+    api_key: str,
+    curl: str,
+    stop_event: asyncio.Event,
+    interval_seconds: float = BATCH_REFRESH_SECONDS,
+) -> None:
+    loop = asyncio.get_running_loop()
+    next_refresh = loop.time() + interval_seconds
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=max(0, next_refresh - loop.time())
+            )
+            return
+        except TimeoutError:
+            pass
+
+        snapshot: Path | None = None
+        try:
+            snapshot = snapshot_recording(recording, audio_file, audio_path)
+            text = await asyncio.to_thread(batch_transcribe, snapshot, api_key, curl)
+            output_path = write_batch_transcript(realtime_path, text)
+            print(f"final更新: {output_path}", flush=True)
+        except BatchTranscriptionError as error:
+            print(f"[batch] 警告: {error}", file=sys.stderr, flush=True)
+        finally:
+            if snapshot is not None:
+                try:
+                    snapshot.unlink(missing_ok=True)
+                except OSError as error:
+                    print(
+                        f"[batch] 警告: 一時WAVを削除できませんでした: {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+        while next_refresh <= loop.time():
+            next_refresh += interval_seconds
 
 
 def finalize_recording(
@@ -375,21 +474,7 @@ def finalize_recording(
     curl: str,
 ) -> Path:
     text = batch_transcribe(audio_path, api_key, curl)
-    output_path = final_transcript_path(realtime_path)
-    completed = datetime.now().astimezone().isoformat(timespec="seconds")
-    try:
-        with output_path.open("x", encoding="utf-8") as transcript:
-            transcript.write(
-                "# Final Transcript\n\n"
-                f"- Completed: {completed}\n"
-                "- Model: `ElevenLabs Scribe v2`\n\n"
-                "## Transcript\n\n"
-                f"{text}\n"
-            )
-    except OSError as error:
-        raise BatchTranscriptionError(
-            f"最終文字起こしを保存できませんでした: {error}"
-        ) from error
+    output_path = write_batch_transcript(realtime_path, text)
     try:
         audio_path.unlink()
     except OSError as error:
@@ -580,6 +665,8 @@ async def run_transcription(
     elevenlabs_api_key: str,
     openai_api_key: str,
     ffmpeg: str,
+    curl: str = "curl",
+    batch_refresh_seconds: float = BATCH_REFRESH_SECONDS,
     translate_to_ja: bool = False,
     cards_enabled: bool = False,
     cards_port: int = 8765,
@@ -598,6 +685,7 @@ async def run_transcription(
     loop.add_signal_handler(signal.SIGINT, stop_event.set)
     process: asyncio.subprocess.Process | None = None
     tasks: list[asyncio.Task[Any]] = []
+    refresh_task: asyncio.Task[None] | None = None
     pipeline: CardPipeline | None = None
     viewer_server: ViewerServer | None = None
 
@@ -658,6 +746,19 @@ async def run_transcription(
                 write_header(transcript, device, translate_to_ja)
                 print(f"保存先: {output_path}")
                 print(f"録音先: {audio_path}")
+
+                refresh_task = asyncio.create_task(
+                    periodically_refresh_final(
+                        output_path,
+                        audio_path,
+                        recording,
+                        audio_file,
+                        elevenlabs_api_key,
+                        curl,
+                        stop_event,
+                        batch_refresh_seconds,
+                    )
+                )
 
                 def write_final(text: str) -> None:
                     transcript.write(text + "\n\n")
@@ -733,6 +834,8 @@ async def run_transcription(
                 else:
                     receiver.result()
 
+                await refresh_task
+
             return output_path, audio_path
     except TranscriptionError:
         raise
@@ -744,6 +847,8 @@ async def run_transcription(
         ) from error
     finally:
         stop_event.set()
+        if refresh_task is not None and not refresh_task.done():
+            await refresh_task
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -814,6 +919,8 @@ def main(argv: list[str] | None = None) -> int:
                 elevenlabs_api_key,
                 openai_api_key,
                 ffmpeg,
+                curl=curl,
+                batch_refresh_seconds=args.batch_refresh_seconds,
                 translate_to_ja=args.translate_ja,
                 cards_enabled=args.cards,
                 cards_port=args.cards_port,
