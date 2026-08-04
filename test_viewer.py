@@ -28,6 +28,7 @@ def test_viewer_server_routes() -> None:
     with tempfile.TemporaryDirectory() as directory:
         transcript_path = Path(directory) / "session-final.md"
         cards_path = Path(directory) / "cards.json"
+        final_cards_path = Path(directory) / "cards-final.json"
         cards_path.write_text(
             json.dumps([asdict(sample_card())]), encoding="utf-8"
         )
@@ -53,9 +54,26 @@ def test_viewer_server_routes() -> None:
             ) as response:
                 payload = json.loads(response.read())
                 assert response.headers.get("Cache-Control") == "no-store"
-            assert "Realtime Diagram Cards" in page
+            with urllib.request.urlopen(
+                f"{server.url}/cards-final", timeout=2
+            ) as response:
+                assert json.loads(response.read()) == []
+
+            final_card = sample_card()
+            final_card.title = "Final Overview"
+            final_cards_path.write_text(
+                json.dumps([asdict(final_card)]), encoding="utf-8"
+            )
+            with urllib.request.urlopen(
+                f"{server.url}/cards-final", timeout=2
+            ) as response:
+                final_payload = json.loads(response.read())
+
+            assert "Diagram Cards" in page
             assert transcript == "# Final\n\nAccurate text."
             assert payload[0]["title"] == "Overview"
+            assert final_payload[0]["title"] == "Final Overview"
+            assert server.final_cards_served.is_set()
 
             try:
                 urllib.request.urlopen(f"{server.url}/missing", timeout=2)
@@ -92,30 +110,55 @@ def test_viewer_page_behavior_and_export() -> None:
     assert "transcript.textContent = text" in page
     assert "setInterval(refreshTranscript, 2000)" in page
     assert "setInterval(refreshCards, 2000)" in page
+    assert 'fetch("/cards-final", {cache: "no-store"})' in page
     assert "source.textContent = card.source_text" in page
     assert "const atBottom" in page
     assert "existing.replaceWith(element)" in page
+    assert 'role="tablist"' in page
+    assert 'role="tab"' in page
+    assert 'role="tabpanel"' in page
+    assert 'id="final-cards-tab"' in page
+    assert 'id="live-cards-tab"' in page
+    assert "ArrowLeft" in page and "ArrowRight" in page
+    assert "Home" in page and "End" in page
+    assert 'tab.addEventListener("click"' in page
+    assert "if (!finalReady && cards.length)" in page
+    assert 'selectCardView("final")' in page
     for component in ("flow", "compare", "tree", "timeline", "keyvalue", "callout"):
         assert f".{component}" in page
 
-    card = sample_card()
-    card.title = "</script><b>unsafe title"
-    card.source_text = "</script><img src=x>"
+    live_card = sample_card()
+    live_card.title = "</script><b>unsafe live title"
+    live_card.source_text = "</script><img src=x>"
+    final_card = sample_card()
+    final_card.id = "final-card"
+    final_card.title = "Final title"
     with tempfile.TemporaryDirectory() as directory:
         output_path = Path(directory) / "export.html"
-        assert viewer.export_cards([card], output_path) == output_path
+        assert viewer.export_cards(
+            [live_card], output_path, final_cards=[final_card]
+        ) == output_path
         exported = output_path.read_text(encoding="utf-8")
 
     assert "const INITIAL_CARDS = [" in exported
+    assert "const INITIAL_FINAL_CARDS = [" in exported
     assert "const TRANSCRIPT_ENABLED = false;" in exported
     assert "\\u003c/script>" in exported
+    assert "Final title" in exported
     assert "if (CARDS_ENABLED && INITIAL_CARDS === null)" in exported
+
+
+def test_final_cards_path() -> None:
+    assert viewer.final_cards_path(Path("cards/session.json")) == Path(
+        "cards/session-final.json"
+    )
 
 
 def main() -> None:
     test_viewer_server_routes()
     test_viewer_without_cards()
     test_viewer_page_behavior_and_export()
+    test_final_cards_path()
     print("ok")
 
 

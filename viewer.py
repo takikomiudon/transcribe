@@ -46,6 +46,14 @@ main { width: min(920px, calc(100% - 32px)); margin: 0 auto; padding: 48px 0 80p
 h1 { margin: 0; font-size: clamp(1.65rem, 4vw, 2.25rem); letter-spacing: -.03em; }
 .panel { margin-bottom: 28px; }
 .panel > h2 { margin: 0 0 12px; font-size: 1.25rem; }
+.cards-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+.cards-header h2 { margin: 0; font-size: 1.25rem; }
+.card-tabs { display: flex; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.card-tab { padding: 7px 14px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font: inherit; font-weight: 700; cursor: pointer; }
+.card-tab[aria-selected="true"] { background: var(--soft); color: var(--accent-strong); }
+.card-tab:disabled { cursor: not-allowed; opacity: .45; }
+.card-tab:focus-visible { outline: 3px solid rgb(49 95 202 / 35%); outline-offset: 2px; }
+.card-status { min-height: 1.65em; margin: -4px 0 12px; color: var(--muted); font-size: .88rem; }
 .transcript {
   min-height: 140px;
   margin: 0;
@@ -101,6 +109,8 @@ details pre { margin: 0; padding: 0 24px 20px; color: var(--muted); font: inheri
 .empty { padding: 32px; border: 1px dashed var(--line); border-radius: 12px; color: var(--muted); text-align: center; }
 @media (max-width: 620px) {
   main { width: min(100% - 20px, 920px); padding-top: 28px; }
+  .cards-header { align-items: stretch; flex-direction: column; }
+  .card-tabs { align-self: flex-start; }
   .compare { grid-template-columns: 1fr; }
   .keyvalue-item { grid-template-columns: 1fr; }
   .card > header, .card-content { padding-right: 18px; padding-left: 18px; }
@@ -118,20 +128,36 @@ details pre { margin: 0; padding: 0 24px 20px; color: var(--muted); font: inheri
     <pre id="transcript" class="transcript" aria-live="polite">最初の文字起こしを待っています。</pre>
   </section>
   <section id="cards-section" class="panel" aria-labelledby="cards-heading">
-    <h2 id="cards-heading">Realtime Diagram Cards</h2>
-    <div id="cards" class="cards" aria-live="polite"><p class="empty">カードを待っています。</p></div>
+    <div class="cards-header">
+      <h2 id="cards-heading">Diagram Cards</h2>
+      <div class="card-tabs" role="tablist" aria-label="カードの種類">
+        <button id="final-cards-tab" class="card-tab" type="button" role="tab" aria-selected="false" aria-controls="cards" aria-disabled="true" tabindex="-1" disabled>品質版</button>
+        <button id="live-cards-tab" class="card-tab" type="button" role="tab" aria-selected="true" aria-controls="cards" tabindex="0">速報版</button>
+      </div>
+    </div>
+    <p id="cards-status" class="card-status" role="status" aria-live="polite">速報版を表示しています。</p>
+    <div id="cards" class="cards" role="tabpanel" aria-labelledby="live-cards-tab" aria-live="polite"><p class="empty">カードを待っています。</p></div>
   </section>
 </main>
 <script>
 const INITIAL_CARDS = null;
+const INITIAL_FINAL_CARDS = null;
 const CARDS_ENABLED = true;
 const TRANSCRIPT_ENABLED = true;
 const transcriptSection = document.getElementById("transcript-section");
 const transcript = document.getElementById("transcript");
 const cardsSection = document.getElementById("cards-section");
 const root = document.getElementById("cards");
+const status = document.getElementById("cards-status");
+const finalTab = document.getElementById("final-cards-tab");
+const liveTab = document.getElementById("live-cards-tab");
+const tabs = [finalTab, liveTab];
 const versions = new Map();
 let transcriptVersion = "";
+let liveCards = INITIAL_CARDS || [];
+let finalCards = INITIAL_FINAL_CARDS || [];
+let finalReady = finalCards.length > 0;
+let activeView = "live";
 
 function cardElement(card) {
   const article = document.createElement("article");
@@ -157,8 +183,18 @@ function cardElement(card) {
   return article;
 }
 
-function render(cards) {
+function render(cards, reset = false) {
   const atBottom = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 80;
+  if (reset) {
+    root.textContent = "";
+    versions.clear();
+  }
+  if (!cards.length && !root.querySelector(".empty")) {
+    const empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = "カードを待っています。";
+    root.append(empty);
+  }
   if (cards.length && root.querySelector(".empty")) root.textContent = "";
   for (const card of cards) {
     const version = JSON.stringify(card);
@@ -170,6 +206,40 @@ function render(cards) {
     versions.set(card.id, version);
   }
   if (atBottom) requestAnimationFrame(() => window.scrollTo({top: document.documentElement.scrollHeight, behavior: "smooth"}));
+}
+
+function selectCardView(view, announce = false) {
+  if (view === "final" && !finalReady) return;
+  activeView = view;
+  for (const tab of tabs) {
+    const selected = tab.dataset.view === view;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  }
+  const selectedTab = view === "final" ? finalTab : liveTab;
+  root.setAttribute("aria-labelledby", selectedTab.id);
+  render(view === "final" ? finalCards : liveCards, true);
+  const label = view === "final" ? "品質版" : "速報版";
+  status.textContent = announce ? `${label}に切り替えました。` : `${label}を表示しています。`;
+}
+
+finalTab.dataset.view = "final";
+liveTab.dataset.view = "live";
+for (const tab of tabs) {
+  tab.addEventListener("click", () => selectCardView(tab.dataset.view, true));
+  tab.addEventListener("keydown", event => {
+    const enabledTabs = tabs.filter(item => !item.disabled);
+    const current = enabledTabs.indexOf(tab);
+    let next = null;
+    if (event.key === "ArrowLeft") next = (current - 1 + enabledTabs.length) % enabledTabs.length;
+    if (event.key === "ArrowRight") next = (current + 1) % enabledTabs.length;
+    if (event.key === "Home") next = 0;
+    if (event.key === "End") next = enabledTabs.length - 1;
+    if (next === null) return;
+    event.preventDefault();
+    enabledTabs[next].focus();
+    selectCardView(enabledTabs[next].dataset.view, true);
+  });
 }
 
 async function refreshTranscript() {
@@ -189,9 +259,28 @@ async function refreshCards() {
   try {
     const response = await fetch("/cards", {cache: "no-store"});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    render(await response.json());
+    liveCards = await response.json();
+    if (activeView === "live") render(liveCards);
   } catch (error) {
     console.warn("カードを取得できません", error);
+  }
+}
+
+async function refreshFinalCards() {
+  try {
+    const response = await fetch("/cards-final", {cache: "no-store"});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const cards = await response.json();
+    if (!cards.length) return;
+    finalCards = cards;
+    finalTab.disabled = false;
+    finalTab.setAttribute("aria-disabled", "false");
+    if (!finalReady && cards.length) {
+      finalReady = true;
+      selectCardView("final", true);
+    } else if (activeView === "final") render(finalCards, true);
+  } catch (error) {
+    console.warn("品質版カードを取得できません", error);
   }
 }
 
@@ -203,8 +292,14 @@ if (TRANSCRIPT_ENABLED) {
 if (CARDS_ENABLED && INITIAL_CARDS === null) {
   refreshCards();
   setInterval(refreshCards, 2000);
+  refreshFinalCards();
+  setInterval(refreshFinalCards, 2000);
 } else if (CARDS_ENABLED) {
-  render(INITIAL_CARDS);
+  if (finalReady) {
+    finalTab.disabled = false;
+    finalTab.setAttribute("aria-disabled", "false");
+    selectCardView("final");
+  } else selectCardView("live");
 } else cardsSection.hidden = true;
 </script>
 </body>
@@ -215,6 +310,7 @@ if (CARDS_ENABLED && INITIAL_CARDS === null) {
 def viewer_page(
     cards: list[Card] | None = None,
     *,
+    final_cards: list[Card] | None = None,
     cards_enabled: bool = True,
     transcript_enabled: bool = True,
 ) -> str:
@@ -225,26 +321,42 @@ def viewer_page(
         "const TRANSCRIPT_ENABLED = true;",
         f"const TRANSCRIPT_ENABLED = {str(transcript_enabled).lower()};",
     )
-    if cards is None:
-        return page
-    initial_cards = json.dumps(
-        [asdict(card) for card in cards], ensure_ascii=False, separators=(",", ":")
-    )
-    initial_cards = (
-        initial_cards.replace("<", "\\u003c")
-        .replace("\u2028", "\\u2028")
-        .replace("\u2029", "\\u2029")
-    )
-    return page.replace(
-        "const INITIAL_CARDS = null;", f"const INITIAL_CARDS = {initial_cards};"
-    )
+    for name, initial in (("INITIAL_CARDS", cards), ("INITIAL_FINAL_CARDS", final_cards)):
+        if initial is None:
+            continue
+        serialized = json.dumps(
+            [asdict(card) for card in initial],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        serialized = (
+            serialized.replace("<", "\\u003c")
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029")
+        )
+        page = page.replace(f"const {name} = null;", f"const {name} = {serialized};")
+    return page
 
 
-def export_cards(cards: list[Card], output_path: Path) -> Path:
+def export_cards(
+    cards: list[Card],
+    output_path: Path,
+    *,
+    final_cards: list[Card] | None = None,
+) -> Path:
     output_path.write_text(
-        viewer_page(cards, transcript_enabled=False), encoding="utf-8"
+        viewer_page(
+            cards,
+            final_cards=final_cards,
+            transcript_enabled=False,
+        ),
+        encoding="utf-8",
     )
     return output_path
+
+
+def final_cards_path(cards_path: Path) -> Path:
+    return cards_path.with_name(f"{cards_path.stem}-final.json")
 
 
 class ViewerServer:
@@ -256,9 +368,15 @@ class ViewerServer:
     ) -> None:
         self.transcript_path = transcript_path
         self.cards_path = cards_path
+        self.final_cards_path = (
+            final_cards_path(cards_path) if cards_path is not None else None
+        )
+        self.final_cards_served = threading.Event()
         self.thread: threading.Thread | None = None
         transcript_file = self.transcript_path
         cards_file = self.cards_path
+        final_cards_file = self.final_cards_path
+        final_cards_served = self.final_cards_served
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
@@ -283,6 +401,18 @@ class ViewerServer:
                         except FileNotFoundError:
                             body = b"[]"
                     self._send(200, "application/json; charset=utf-8", body)
+                    return
+                if path == "/cards-final":
+                    if final_cards_file is None:
+                        body = b"[]"
+                    else:
+                        try:
+                            body = final_cards_file.read_bytes()
+                        except FileNotFoundError:
+                            body = b"[]"
+                    self._send(200, "application/json; charset=utf-8", body)
+                    if final_cards_file is not None and final_cards_file.exists():
+                        final_cards_served.set()
                     return
                 self._send(404, "text/plain; charset=utf-8", "Not found".encode())
 
@@ -319,3 +449,6 @@ class ViewerServer:
         self.server.server_close()
         self.thread.join(timeout=2)
         self.thread = None
+
+    def wait_for_final_cards(self, timeout: float = 3) -> bool:
+        return self.final_cards_served.wait(timeout)
