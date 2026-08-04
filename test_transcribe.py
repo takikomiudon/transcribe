@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import time
+import urllib.error
 import wave
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict
@@ -57,6 +58,54 @@ def test_translation_configuration_and_output() -> None:
             ]
         }
     ) == "こんにちは。"
+
+
+def test_transcript_correction_configuration_and_fallback() -> None:
+    response = MagicMock()
+    response.__enter__.return_value.read.return_value = json.dumps(
+        {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "セブンイレブンです。"}
+                    ],
+                }
+            ]
+        }
+    ).encode()
+    with patch("transcribe.urllib.request.urlopen", return_value=response) as urlopen:
+        corrected = transcribe.correct_transcript(
+            "セルユニットです。",
+            "コンビニの話です。",
+            ["セブンイレブン"],
+            "openai-key",
+        )
+
+    assert corrected == "セブンイレブンです。"
+    request = urlopen.call_args.args[0]
+    payload = json.loads(request.data)
+    assert payload["model"] == transcribe.TRANSLATION_MODEL
+    assert payload["reasoning"] == {"effort": "none"}
+    assert payload["store"] is False
+    assert json.loads(payload["input"]) == {
+        "context": "コンビニの話です。",
+        "glossary": ["セブンイレブン"],
+        "text": "セルユニットです。",
+    }
+    assert urlopen.call_args.kwargs["timeout"] == 10
+
+    for error in (TimeoutError("slow"), urllib.error.URLError("offline")):
+        stderr = io.StringIO()
+        with (
+            patch("transcribe.urllib.request.urlopen", side_effect=error),
+            redirect_stderr(stderr),
+        ):
+            assert (
+                transcribe.correct_transcript("原文です。", "", [], "openai-key")
+                == "原文です。"
+            )
+        assert "[補正] 警告:" in stderr.getvalue()
 
 
 def test_batch_transcription_request_and_output() -> None:
@@ -996,6 +1045,7 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
 def main() -> None:
     test_model_configuration()
     test_translation_configuration_and_output()
+    test_transcript_correction_configuration_and_fallback()
     test_batch_transcription_request_and_output()
     test_batch_transcription_errors_are_user_facing()
     test_recording_snapshot_is_a_complete_wav()

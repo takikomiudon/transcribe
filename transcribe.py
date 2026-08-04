@@ -55,6 +55,7 @@ UPLOAD_CHUNK_MILLISECONDS = 100
 UPLOAD_CHUNK_BYTES = SAMPLE_RATE * 2 * UPLOAD_CHUNK_MILLISECONDS // 1_000
 FINAL_WAIT_SECONDS = 5
 BATCH_REFRESH_SECONDS = 30
+CORRECTION_TIMEOUT_SECONDS = 10
 TRANSLATION_TIMEOUT_SECONDS = 20
 ENV_FILE = Path(".env.local")
 
@@ -328,6 +329,56 @@ def translation_payload(text: str) -> dict[str, Any]:
     }
 
 
+def correction_payload(text: str, context: str, glossary: list[str]) -> dict[str, Any]:
+    return {
+        "model": TRANSLATION_MODEL,
+        "reasoning": {"effort": "none"},
+        "instructions": (
+            "入力はASR（音声認識）の出力です。誤変換の修正だけを行ってください。"
+            "入力JSONのcontextとglossaryを参照し、同音異義語の誤変換、助詞の欠落、"
+            "固有名詞の誤認識を修正してください。要約、追加、並べ替え、文体変更は禁止です。"
+            "長さは入力とほぼ同じにし、確信が持てない箇所は原文のまま残してください。"
+            "修正後のテキストだけを出力してください。"
+        ),
+        "input": json.dumps(
+            {"context": context, "glossary": glossary, "text": text},
+            ensure_ascii=False,
+        ),
+        "max_output_tokens": 1_024,
+        "store": False,
+    }
+
+
+def request_response_text(
+    payload: dict[str, Any], api_key: str, timeout: float
+) -> str:
+    request = urllib.request.Request(
+        RESPONSES_URL,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response_output_text(json.loads(response.read()))
+
+
+def correct_transcript(
+    text: str, context: str, glossary: list[str], api_key: str
+) -> str:
+    try:
+        return request_response_text(
+            correction_payload(text, context, glossary),
+            api_key,
+            CORRECTION_TIMEOUT_SECONDS,
+        )
+    except Exception as error:
+        print(f"[補正] 警告: {error}", file=sys.stderr, flush=True)
+        return text
+
+
 def batch_transcribe(audio_path: Path, api_key: str, curl: str) -> str:
     try:
         result = subprocess.run(
@@ -502,20 +553,10 @@ def response_output_text(response: dict[str, Any]) -> str:
 
 
 def translate_to_japanese(text: str, api_key: str) -> str:
-    request = urllib.request.Request(
-        RESPONSES_URL,
-        data=json.dumps(translation_payload(text)).encode(),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(
-            request, timeout=TRANSLATION_TIMEOUT_SECONDS
-        ) as response:
-            payload = json.loads(response.read())
+        return request_response_text(
+            translation_payload(text), api_key, TRANSLATION_TIMEOUT_SECONDS
+        )
     except urllib.error.HTTPError as error:
         try:
             detail = json.loads(error.read()).get("error", {}).get("message")
@@ -526,7 +567,6 @@ def translate_to_japanese(text: str, api_key: str) -> str:
         raise TranslationError(f"日本語翻訳との通信に失敗しました: {error}") from error
     except json.JSONDecodeError as error:
         raise TranslationError("日本語翻訳から不正なJSONを受信しました。") from error
-    return response_output_text(payload)
 
 
 def write_header(file: Any, device: int, translate_to_ja: bool = False) -> None:
