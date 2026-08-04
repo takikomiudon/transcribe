@@ -130,6 +130,130 @@ def test_generate_card_parses_and_sanitizes_response() -> None:
     }
 
 
+def test_final_card_generation_payload() -> None:
+    payload = cards.final_card_generation_payload("Complete final transcript.")
+
+    assert payload["input"] == "Complete final transcript."
+    assert payload["store"] is False
+    output_format = payload["text"]["format"]
+    assert output_format["type"] == "json_schema"
+    assert output_format["strict"] is True
+    item = output_format["schema"]["properties"]["cards"]["items"]
+    assert item["required"] == ["title", "html", "source_text"]
+
+
+def test_generate_final_cards_parses_and_sanitizes_all_cards() -> None:
+    response_body = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": json.dumps(
+                            {
+                                "cards": [
+                                    {
+                                        "title": "First",
+                                        "html": (
+                                            '<div class="callout" onclick="bad()">'
+                                            "<p>First</p></div>"
+                                        ),
+                                        "source_text": "Accurate first section.",
+                                    },
+                                    {
+                                        "title": "Second",
+                                        "html": '<div class="flow"><p>Second</p></div>',
+                                        "source_text": "Accurate second section.",
+                                    },
+                                ]
+                            }
+                        ),
+                    }
+                ],
+            }
+        ],
+    }
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(response_body).encode()
+
+    with patch("cards.urllib.request.urlopen", return_value=FakeResponse()):
+        generated = cards.generate_final_cards("final", "api-key")
+
+    assert [card.title for card in generated] == ["First", "Second"]
+    assert generated[0].html == '<div class="callout"><p>First</p></div>'
+    assert generated[1].source_text == "Accurate second section."
+    assert all(card.status == "done" for card in generated)
+
+
+def test_generate_final_cards_rejects_empty_or_invalid_cards() -> None:
+    class FakeResponse:
+        def __init__(self, result: object) -> None:
+            self.result = result
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": json.dumps(self.result),
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ).encode()
+
+    for result in (
+        {"cards": []},
+        {"cards": [{"title": "", "html": "<p>x</p>", "source_text": "x"}]},
+        {"cards": [{"title": "x", "html": "", "source_text": "x"}]},
+        {"cards": [{"title": "x", "html": "<p>x</p>", "source_text": ""}]},
+    ):
+        with patch(
+            "cards.urllib.request.urlopen", return_value=FakeResponse(result)
+        ):
+            try:
+                cards.generate_final_cards("final", "api-key")
+            except cards.CardGenerationError:
+                pass
+            else:
+                raise AssertionError("CardGenerationError was not raised")
+
+
+def test_card_store_replaces_all_cards_atomically() -> None:
+    live = cards.Card("live", "Live", "<p>live</p>", "live", 1, "done")
+    final = cards.Card("final", "Final", "<p>final</p>", "final", 2, "done")
+    with tempfile.TemporaryDirectory() as directory:
+        store = cards.CardStore(Path(directory))
+        store.append(live)
+        store.replace_all([final])
+
+        assert store.snapshot() == [final]
+        saved = json.loads(store.json_path.read_text(encoding="utf-8"))
+        assert [card["id"] for card in saved] == ["final"]
+
+
 async def test_card_pipeline_applies_decisions_in_order() -> None:
     generated = [
         {
@@ -218,6 +342,10 @@ def main() -> None:
     test_sanitize_card_html()
     test_card_generation_payload()
     test_generate_card_parses_and_sanitizes_response()
+    test_final_card_generation_payload()
+    test_generate_final_cards_parses_and_sanitizes_all_cards()
+    test_generate_final_cards_rejects_empty_or_invalid_cards()
+    test_card_store_replaces_all_cards_atomically()
     asyncio.run(test_card_pipeline_applies_decisions_in_order())
     asyncio.run(test_card_pipeline_records_error_after_two_failures())
     print("ok")

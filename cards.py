@@ -85,6 +85,25 @@ transcription errors without adding unsupported facts. For skip, return empty
 title and html strings.
 """
 
+FINAL_CARD_INSTRUCTIONS = """\
+You turn a complete final lecture transcript into compact Japanese diagram
+cards. Read the whole transcript first, then split it into meaningful topics.
+Return the cards in transcript order. Skip chatter, repetition, and content too
+insubstantial to diagram. For each card, copy the relevant final transcript
+passage into source_text.
+
+Return a concise title and only the card's inner HTML. Use one of these
+component roots: flow, compare, tree, timeline, keyvalue, or callout. Allowed
+tags are div, span, p, ul, ol, li, table, thead, tbody, tr, th, td, h3, h4,
+strong, and em. Allowed classes are card-body, flow, flow-step, flow-arrow,
+compare, compare-item, tree, tree-branch, timeline, timeline-item, keyvalue,
+keyvalue-item, key, value, callout, label, accent, and muted. Never output html,
+style, script, inline style, event handlers, URLs, images, or any other
+tags/classes. Keep each card to a heading and 3-7 elements with no internal
+scrolling. Naturally correct obvious transcription errors without adding
+unsupported facts.
+"""
+
 CARD_SCHEMA = {
     "type": "object",
     "properties": {
@@ -96,6 +115,27 @@ CARD_SCHEMA = {
         "html": {"type": "string"},
     },
     "required": ["decision", "title", "html"],
+    "additionalProperties": False,
+}
+
+FINAL_CARD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "cards": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "html": {"type": "string"},
+                    "source_text": {"type": "string"},
+                },
+                "required": ["title", "html", "source_text"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["cards"],
     "additionalProperties": False,
 }
 
@@ -263,6 +303,27 @@ def card_generation_payload(
     }
 
 
+def final_card_generation_payload(transcript: str) -> dict[str, Any]:
+    # ponytail: one full-transcript request; add chapter batching only if model
+    # limits are reached in real recordings.
+    return {
+        "model": CARD_MODEL,
+        "reasoning": {"effort": "none"},
+        "instructions": FINAL_CARD_INSTRUCTIONS,
+        "input": transcript,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "final_diagram_cards",
+                "schema": FINAL_CARD_SCHEMA,
+                "strict": True,
+            }
+        },
+        "max_output_tokens": 16_384,
+        "store": False,
+    }
+
+
 def _response_output_text(response: dict[str, Any]) -> str:
     if response.get("status") != "completed":
         raise CardGenerationError("図解生成が完了しませんでした。")
@@ -281,17 +342,10 @@ def _response_output_text(response: dict[str, Any]) -> str:
     return text
 
 
-def generate_card(
-    source_text: str,
-    api_key: str,
-    last_card: Card | None,
-    topic_outline: list[str],
-) -> dict[str, object]:
+def _request_card_generation(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
     request = urllib.request.Request(
         RESPONSES_URL,
-        data=json.dumps(
-            card_generation_payload(source_text, last_card, topic_outline)
-        ).encode(),
+        data=json.dumps(payload).encode(),
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -302,7 +356,7 @@ def generate_card(
         with urllib.request.urlopen(
             request, timeout=CARD_TIMEOUT_SECONDS
         ) as response:
-            payload = json.loads(response.read())
+            response_payload = json.loads(response.read())
     except urllib.error.HTTPError as error:
         try:
             detail = json.loads(error.read()).get("error", {}).get("message")
@@ -313,6 +367,18 @@ def generate_card(
         raise CardGenerationError(f"図解生成との通信に失敗しました: {error}") from error
     except json.JSONDecodeError as error:
         raise CardGenerationError("図解生成から不正なJSONを受信しました。") from error
+    return response_payload
+
+
+def generate_card(
+    source_text: str,
+    api_key: str,
+    last_card: Card | None,
+    topic_outline: list[str],
+) -> dict[str, object]:
+    payload = _request_card_generation(
+        card_generation_payload(source_text, last_card, topic_outline), api_key
+    )
 
     try:
         result = json.loads(_response_output_text(payload))
@@ -337,6 +403,57 @@ def generate_card(
         "html": sanitized_html,
         "total_tokens": total_tokens,
     }
+
+
+def generate_final_cards(transcript: str, api_key: str) -> list[Card]:
+    payload = _request_card_generation(
+        final_card_generation_payload(transcript), api_key
+    )
+    try:
+        result = json.loads(_response_output_text(payload))
+        raw_cards = result["cards"]
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise CardGenerationError("final図解生成の応答形式が不正です。") from error
+    if not isinstance(raw_cards, list) or not raw_cards:
+        raise CardGenerationError("final図解生成のカードが空です。")
+
+    generated: list[Card] = []
+    for raw_card in raw_cards:
+        if not isinstance(raw_card, dict) or not all(
+            isinstance(raw_card.get(key), str)
+            for key in ("title", "html", "source_text")
+        ):
+            raise CardGenerationError("final図解生成のカード形式が不正です。")
+        title = raw_card["title"].strip()
+        source_text = raw_card["source_text"].strip()
+        card_html = sanitize_card_html(raw_card["html"])
+        if not title or not card_html or not source_text:
+            raise CardGenerationError("final図解生成のカードに空の項目があります。")
+        generated.append(
+            Card(
+                id=uuid.uuid4().hex,
+                title=title,
+                html=card_html,
+                source_text=source_text,
+                created_at=time.time(),
+                status="done",
+            )
+        )
+    return generated
+
+
+def save_cards(cards: list[Card], output_path: Path) -> None:
+    temporary = output_path.with_suffix(f"{output_path.suffix}.tmp")
+    temporary.write_text(
+        json.dumps(
+            [asdict(card) for card in cards],
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(output_path)
 
 
 class CardStore:
@@ -372,18 +489,12 @@ class CardStore:
         self.cards[-1] = card
         self._persist()
 
+    def replace_all(self, cards: list[Card]) -> None:
+        self.cards = list(cards)
+        self._persist()
+
     def _persist(self) -> None:
-        temporary = self.json_path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(
-                [asdict(card) for card in self.cards],
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(self.json_path)
+        save_cards(self.cards, self.json_path)
 
 
 class CardPipeline:
