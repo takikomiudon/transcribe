@@ -35,6 +35,8 @@ from cards import (
     CARD_IDLE_SECONDS,
     CARD_MAX_SECONDS,
     CardPipeline,
+    generate_final_cards,
+    save_cards,
 )
 from viewer import ViewerServer, export_cards
 
@@ -472,7 +474,7 @@ def finalize_recording(
     audio_path: Path,
     api_key: str,
     curl: str,
-) -> Path:
+) -> tuple[Path, str]:
     text = batch_transcribe(audio_path, api_key, curl)
     output_path = write_batch_transcript(realtime_path, text)
     try:
@@ -481,7 +483,7 @@ def finalize_recording(
         raise BatchTranscriptionError(
             f"録音を削除できませんでした: {error}"
         ) from error
-    return output_path
+    return output_path, text
 
 
 def response_output_text(response: dict[str, Any]) -> str:
@@ -673,7 +675,7 @@ async def run_transcription(
     cards_character_threshold: int = CARD_CHARACTER_THRESHOLD,
     cards_idle_seconds: int = CARD_IDLE_SECONDS,
     cards_max_seconds: int = CARD_MAX_SECONDS,
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, Path | None, Path | None]:
     try:
         from websockets.asyncio.client import connect
     except ImportError as error:
@@ -839,7 +841,12 @@ async def run_transcription(
 
                 await refresh_task
 
-            return output_path, audio_path
+            return (
+                output_path,
+                audio_path,
+                pipeline.json_path if pipeline is not None else None,
+                pipeline.html_path if pipeline is not None else None,
+            )
     except TranscriptionError:
         raise
     except OSError as error:
@@ -916,7 +923,7 @@ def main(argv: list[str] | None = None) -> int:
 
     audio_path: Path | None = None
     try:
-        output_path, audio_path = asyncio.run(
+        output_path, audio_path, cards_json_path, cards_html_path = asyncio.run(
             run_transcription(
                 args.device,
                 elevenlabs_api_key,
@@ -933,7 +940,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         print("ElevenLabsで最終文字起こし中です...")
-        final_path = finalize_recording(
+        final_path, final_text = finalize_recording(
             output_path,
             audio_path,
             elevenlabs_api_key,
@@ -944,6 +951,28 @@ def main(argv: list[str] | None = None) -> int:
         if audio_path is not None and audio_path.exists():
             print(f"録音を保持しました: {audio_path}", file=sys.stderr)
         return 1
+
+    if cards_json_path is not None and cards_html_path is not None:
+        temporary_html = cards_html_path.with_suffix(
+            f"{cards_html_path.suffix}.final.tmp"
+        )
+        try:
+            final_cards = generate_final_cards(final_text, openai_api_key)
+            export_cards(final_cards, temporary_html)
+            save_cards(final_cards, cards_json_path)
+            temporary_html.replace(cards_html_path)
+            print(f"final図解HTML: {cards_html_path}")
+        except Exception as error:
+            print(
+                f"[cards] 警告: final図解を生成できませんでした。"
+                f"速報版を保持します: {error}",
+                file=sys.stderr,
+            )
+        finally:
+            try:
+                temporary_html.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     print(f"リアルタイム記録: {output_path}")
     print(f"最終文字起こし: {final_path}")

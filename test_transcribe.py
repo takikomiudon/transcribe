@@ -17,6 +17,7 @@ from types import ModuleType, SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import MagicMock, patch
 
+from cards import Card, CardGenerationError
 import transcribe
 
 
@@ -244,7 +245,7 @@ def test_completed_batch_is_saved_before_recording_is_deleted() -> None:
         with patch(
             "transcribe.batch_transcribe", return_value="Final transcript."
         ):
-            final_path = transcribe.finalize_recording(
+            final_path, final_text = transcribe.finalize_recording(
                 realtime_path,
                 audio_path,
                 "secret-key",
@@ -252,6 +253,7 @@ def test_completed_batch_is_saved_before_recording_is_deleted() -> None:
             )
 
         assert final_path == Path(directory) / "20260804-120000-final.md"
+        assert final_text == "Final transcript."
         assert "Final transcript." in final_path.read_text(encoding="utf-8")
         assert not audio_path.exists()
 
@@ -499,10 +501,12 @@ def test_openai_key_is_only_required_for_openai_features() -> None:
             return_value="coroutine",
         ) as run_job,
         patch(
-            "transcribe.asyncio.run", return_value=(output_path, audio_path)
+            "transcribe.asyncio.run",
+            return_value=(output_path, audio_path, None, None),
         ) as run,
         patch(
-            "transcribe.finalize_recording", return_value=final_path
+            "transcribe.finalize_recording",
+            return_value=(final_path, "Final transcript."),
         ) as finalize,
     ):
         assert transcribe.main(["--device", "0"]) == 0
@@ -556,7 +560,12 @@ def test_batch_failure_returns_error_and_reports_preserved_recording() -> None:
             ),
             patch(
                 "transcribe.asyncio.run",
-                return_value=(Path("transcripts/session.md"), audio_path),
+                return_value=(
+                    Path("transcripts/session.md"),
+                    audio_path,
+                    None,
+                    None,
+                ),
             ),
             patch(
                 "transcribe.finalize_recording",
@@ -569,6 +578,74 @@ def test_batch_failure_returns_error_and_reports_preserved_recording() -> None:
         assert audio_path.exists()
         assert "API failed" in stderr.getvalue()
         assert str(audio_path) in stderr.getvalue()
+
+
+def test_final_cards_replace_live_artifacts_only_on_success() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        output_path = root / "session.md"
+        audio_path = root / "session.wav"
+        final_path = root / "session-final.md"
+        cards_path = root / "cards.json"
+        html_path = root / "cards.html"
+        quality_card = Card(
+            "final",
+            "Final card",
+            '<div class="callout"><p>Accurate</p></div>',
+            "Accurate final transcript.",
+            1,
+            "done",
+        )
+
+        for error in (None, CardGenerationError("failed")):
+            cards_path.write_text("live json", encoding="utf-8")
+            html_path.write_text("live html", encoding="utf-8")
+            stderr = io.StringIO()
+            with (
+                patch(
+                    "transcribe.shutil.which",
+                    side_effect=lambda name: f"/usr/bin/{name}",
+                ),
+                patch(
+                    "transcribe.load_api_key",
+                    side_effect=lambda name: (
+                        "eleven-key" if name == "ELEVENLABS_API_KEY" else "openai-key"
+                    ),
+                ),
+                patch(
+                    "transcribe.run_transcription",
+                    new_callable=MagicMock,
+                    return_value="coroutine",
+                ),
+                patch(
+                    "transcribe.asyncio.run",
+                    return_value=(output_path, audio_path, cards_path, html_path),
+                ),
+                patch(
+                    "transcribe.finalize_recording",
+                    return_value=(final_path, "Accurate final transcript."),
+                ),
+                patch(
+                    "transcribe.generate_final_cards",
+                    side_effect=error,
+                    return_value=[quality_card],
+                ) as generate,
+                redirect_stderr(stderr),
+            ):
+                assert transcribe.main(["--device", "0", "--cards"]) == 0
+
+            generate.assert_called_once_with(
+                "Accurate final transcript.", "openai-key"
+            )
+            if error is None:
+                assert json.loads(cards_path.read_text(encoding="utf-8"))[0][
+                    "title"
+                ] == "Final card"
+                assert "Final card" in html_path.read_text(encoding="utf-8")
+            else:
+                assert cards_path.read_text(encoding="utf-8") == "live json"
+                assert html_path.read_text(encoding="utf-8") == "live html"
+                assert "速報版を保持" in stderr.getvalue()
 
 
 async def test_capture_eof_and_process_cleanup() -> None:
@@ -853,7 +930,12 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
                 transcribe.CHUNK_BYTES
             )
 
-    assert result == (transcript_path, recording_path)
+    assert result == (
+        transcript_path,
+        recording_path,
+        pipeline_instances[0].json_path,
+        pipeline_instances[0].html_path,
+    )
     assert "Original text" in saved
     assert "日本語訳" in saved
     assert connect_calls[0][0] == (transcribe.realtime_url(),)
@@ -901,6 +983,7 @@ def main() -> None:
     test_realtime_events_and_repeated_transcripts()
     test_missing_key_stops_before_capture()
     test_batch_failure_returns_error_and_reports_preserved_recording()
+    test_final_cards_replace_live_artifacts_only_on_success()
     asyncio.run(test_capture_eof_and_process_cleanup())
     asyncio.run(test_websocket_error_preserves_completed_output())
     asyncio.run(test_partial_display_and_provider_error_events())

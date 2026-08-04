@@ -58,7 +58,7 @@ uv run transcribe.py --device 0
 uv run transcribe.py --device 0 --translate-ja
 ```
 
-確定した発話からOpenAIで話題ごとの図解カードを生成する場合は、`--cards` を追加します。通常の文字起こしでも開くローカルビューアにカードが追加され、終了時には同じ内容を `cards_output/YYYYMMDD-HHMMSS.html` とJSONへ保存します。
+確定した発話からOpenAIで話題ごとの図解カードを生成する場合は、`--cards` を追加します。録音中はRealtimeの確定結果から速報カードがローカルビューアへ追加されます。停止後はScribe v2のfinal transcript全文を見て意味単位を分割し直した品質版で、同じ `cards_output/YYYYMMDD-HHMMSS.html` とJSONを差し替えます。品質版の生成に失敗した場合は速報版が残ります。
 
 ```sh
 uv run transcribe.py --device 0 --cards
