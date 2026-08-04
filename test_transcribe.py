@@ -12,6 +12,7 @@ import tempfile
 import time
 import wave
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import asdict
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from urllib.parse import parse_qs, urlparse
@@ -502,7 +503,7 @@ def test_openai_key_is_only_required_for_openai_features() -> None:
         ) as run_job,
         patch(
             "transcribe.asyncio.run",
-            return_value=(output_path, audio_path, None, None),
+            return_value=(output_path, audio_path, None, None, None),
         ) as run,
         patch(
             "transcribe.finalize_recording",
@@ -547,6 +548,7 @@ def test_batch_failure_returns_error_and_reports_preserved_recording() -> None:
     with tempfile.TemporaryDirectory() as directory:
         audio_path = Path(directory) / "session.wav"
         audio_path.write_bytes(b"audio")
+        viewer_server = MagicMock()
         with (
             patch(
                 "transcribe.shutil.which",
@@ -565,6 +567,7 @@ def test_batch_failure_returns_error_and_reports_preserved_recording() -> None:
                     audio_path,
                     None,
                     None,
+                    viewer_server,
                 ),
             ),
             patch(
@@ -578,6 +581,7 @@ def test_batch_failure_returns_error_and_reports_preserved_recording() -> None:
         assert audio_path.exists()
         assert "API failed" in stderr.getvalue()
         assert str(audio_path) in stderr.getvalue()
+        viewer_server.stop.assert_called_once_with()
 
 
 def test_final_cards_replace_live_artifacts_only_on_success() -> None:
@@ -596,10 +600,22 @@ def test_final_cards_replace_live_artifacts_only_on_success() -> None:
             1,
             "done",
         )
+        live_card = Card(
+            "live",
+            "Live card",
+            '<div class="callout"><p>Fast</p></div>',
+            "Realtime transcript.",
+            1,
+            "done",
+        )
 
         for error in (None, CardGenerationError("failed")):
-            cards_path.write_text("live json", encoding="utf-8")
+            live_json = json.dumps([asdict(live_card)])
+            cards_path.write_text(live_json, encoding="utf-8")
             html_path.write_text("live html", encoding="utf-8")
+            final_cards_path = root / "cards-final.json"
+            final_cards_path.unlink(missing_ok=True)
+            viewer_server = MagicMock()
             stderr = io.StringIO()
             with (
                 patch(
@@ -619,7 +635,13 @@ def test_final_cards_replace_live_artifacts_only_on_success() -> None:
                 ),
                 patch(
                     "transcribe.asyncio.run",
-                    return_value=(output_path, audio_path, cards_path, html_path),
+                    return_value=(
+                        output_path,
+                        audio_path,
+                        cards_path,
+                        html_path,
+                        viewer_server,
+                    ),
                 ),
                 patch(
                     "transcribe.finalize_recording",
@@ -638,14 +660,20 @@ def test_final_cards_replace_live_artifacts_only_on_success() -> None:
                 "Accurate final transcript.", "openai-key"
             )
             if error is None:
-                assert json.loads(cards_path.read_text(encoding="utf-8"))[0][
-                    "title"
-                ] == "Final card"
+                assert cards_path.read_text(encoding="utf-8") == live_json
+                assert json.loads(
+                    final_cards_path.read_text(encoding="utf-8")
+                )[0]["title"] == "Final card"
+                assert "Live card" in html_path.read_text(encoding="utf-8")
                 assert "Final card" in html_path.read_text(encoding="utf-8")
+                viewer_server.wait_for_final_cards.assert_called_once_with()
             else:
-                assert cards_path.read_text(encoding="utf-8") == "live json"
+                assert cards_path.read_text(encoding="utf-8") == live_json
+                assert not final_cards_path.exists()
                 assert html_path.read_text(encoding="utf-8") == "live html"
                 assert "速報版を保持" in stderr.getvalue()
+                viewer_server.wait_for_final_cards.assert_not_called()
+            viewer_server.stop.assert_called_once_with()
 
 
 async def test_capture_eof_and_process_cleanup() -> None:
@@ -935,6 +963,7 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
         recording_path,
         pipeline_instances[0].json_path,
         pipeline_instances[0].html_path,
+        viewer_instances[0],
     )
     assert "Original text" in saved
     assert "日本語訳" in saved
@@ -959,7 +988,7 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
     )
     assert viewer.cards_path == pipeline.json_path
     assert viewer.started
-    assert viewer.stopped
+    assert not viewer.stopped
     open_browser.assert_called_once_with(["open", viewer.url], check=False)
     export_cards.assert_called_once_with([], pipeline.html_path)
 

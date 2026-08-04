@@ -34,11 +34,12 @@ from cards import (
     CARD_CHARACTER_THRESHOLD,
     CARD_IDLE_SECONDS,
     CARD_MAX_SECONDS,
+    Card,
     CardPipeline,
     generate_final_cards,
     save_cards,
 )
-from viewer import ViewerServer, export_cards
+from viewer import ViewerServer, export_cards, final_cards_path
 
 
 MODEL = "scribe_v2_realtime"
@@ -675,7 +676,7 @@ async def run_transcription(
     cards_character_threshold: int = CARD_CHARACTER_THRESHOLD,
     cards_idle_seconds: int = CARD_IDLE_SECONDS,
     cards_max_seconds: int = CARD_MAX_SECONDS,
-) -> tuple[Path, Path, Path | None, Path | None]:
+) -> tuple[Path, Path, Path | None, Path | None, ViewerServer | None]:
     try:
         from websockets.asyncio.client import connect
     except ImportError as error:
@@ -690,6 +691,7 @@ async def run_transcription(
     refresh_task: asyncio.Task[None] | None = None
     pipeline: CardPipeline | None = None
     viewer_server: ViewerServer | None = None
+    keep_viewer_open = False
 
     if cards_enabled:
         try:
@@ -841,11 +843,13 @@ async def run_transcription(
 
                 await refresh_task
 
+            keep_viewer_open = viewer_server is not None
             return (
                 output_path,
                 audio_path,
                 pipeline.json_path if pipeline is not None else None,
                 pipeline.html_path if pipeline is not None else None,
+                viewer_server,
             )
     except TranscriptionError:
         raise
@@ -875,7 +879,7 @@ async def run_transcription(
                     f"[cards] 警告: 図解の終了処理に失敗しました: {error}",
                     file=sys.stderr,
                 )
-        if viewer_server is not None:
+        if viewer_server is not None and not keep_viewer_open:
             try:
                 viewer_server.stop()
             except OSError as error:
@@ -922,8 +926,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     audio_path: Path | None = None
+    viewer_server: ViewerServer | None = None
     try:
-        output_path, audio_path, cards_json_path, cards_html_path = asyncio.run(
+        (
+            output_path,
+            audio_path,
+            cards_json_path,
+            cards_html_path,
+            viewer_server,
+        ) = asyncio.run(
             run_transcription(
                 args.device,
                 elevenlabs_api_key,
@@ -946,37 +957,55 @@ def main(argv: list[str] | None = None) -> int:
             elevenlabs_api_key,
             curl,
         )
+
+        if cards_json_path is not None and cards_html_path is not None:
+            temporary_html = cards_html_path.with_suffix(
+                f"{cards_html_path.suffix}.final.tmp"
+            )
+            try:
+                final_cards = generate_final_cards(final_text, openai_api_key)
+                live_cards = [
+                    Card(**value)
+                    for value in json.loads(cards_json_path.read_text(encoding="utf-8"))
+                ]
+                export_cards(
+                    live_cards,
+                    temporary_html,
+                    final_cards=final_cards,
+                )
+                quality_path = final_cards_path(cards_json_path)
+                save_cards(final_cards, quality_path)
+                temporary_html.replace(cards_html_path)
+                print(f"final図解JSON: {quality_path}")
+                print(f"final図解HTML: {cards_html_path}")
+                if viewer_server is not None:
+                    viewer_server.wait_for_final_cards()
+            except Exception as error:
+                print(
+                    f"[cards] 警告: final図解を生成できませんでした。"
+                    f"速報版を保持します: {error}",
+                    file=sys.stderr,
+                )
+            finally:
+                try:
+                    temporary_html.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        print(f"リアルタイム記録: {output_path}")
+        print(f"最終文字起こし: {final_path}")
+        return 0
     except TranscriptionError as error:
         print(f"エラー: {error}", file=sys.stderr)
         if audio_path is not None and audio_path.exists():
             print(f"録音を保持しました: {audio_path}", file=sys.stderr)
         return 1
-
-    if cards_json_path is not None and cards_html_path is not None:
-        temporary_html = cards_html_path.with_suffix(
-            f"{cards_html_path.suffix}.final.tmp"
-        )
-        try:
-            final_cards = generate_final_cards(final_text, openai_api_key)
-            export_cards(final_cards, temporary_html)
-            save_cards(final_cards, cards_json_path)
-            temporary_html.replace(cards_html_path)
-            print(f"final図解HTML: {cards_html_path}")
-        except Exception as error:
-            print(
-                f"[cards] 警告: final図解を生成できませんでした。"
-                f"速報版を保持します: {error}",
-                file=sys.stderr,
-            )
-        finally:
+    finally:
+        if viewer_server is not None:
             try:
-                temporary_html.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-    print(f"リアルタイム記録: {output_path}")
-    print(f"最終文字起こし: {final_path}")
-    return 0
+                viewer_server.stop()
+            except OSError as error:
+                print(f"警告: ビューアを停止できません: {error}", file=sys.stderr)
 
 
 if __name__ == "__main__":
