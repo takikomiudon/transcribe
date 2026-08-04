@@ -55,6 +55,9 @@ UPLOAD_CHUNK_MILLISECONDS = 100
 UPLOAD_CHUNK_BYTES = SAMPLE_RATE * 2 * UPLOAD_CHUNK_MILLISECONDS // 1_000
 FINAL_WAIT_SECONDS = 5
 BATCH_REFRESH_SECONDS = 30
+GLOSSARY_WINDOW_SECONDS = 60
+FINAL_REFRESH_GROWTH = 1.5
+GLOSSARY_LIMIT = 50
 CORRECTION_TIMEOUT_SECONDS = 10
 TRANSLATION_TIMEOUT_SECONDS = 20
 ENV_FILE = Path(".env.local")
@@ -476,6 +479,16 @@ def batch_transcribe(audio_path: Path, api_key: str, curl: str) -> str:
     return text.strip()
 
 
+def should_refresh_final(last_frames: int, current_frames: int) -> bool:
+    return last_frames == 0 or current_frames >= last_frames * FINAL_REFRESH_GROWTH
+
+
+def merge_glossary(
+    existing: list[str], new_terms: list[str], limit: int = GLOSSARY_LIMIT
+) -> list[str]:
+    return list(dict.fromkeys([*new_terms, *existing]))[:limit]
+
+
 def snapshot_recording(recording: Any, audio_file: Any, audio_path: Path) -> Path:
     """Copy the complete frames written so far into a valid temporary WAV."""
     snapshot: Path | None = None
@@ -495,6 +508,47 @@ def snapshot_recording(recording: Any, audio_file: Any, audio_path: Path) -> Pat
             f"録音中のWAVスナップショットを作成できませんでした: {error}"
         ) from error
     return snapshot
+
+
+def snapshot_recording_tail(
+    recording: Any,
+    audio_file: Any,
+    audio_path: Path,
+    seconds: float,
+) -> Path:
+    snapshot = snapshot_recording(recording, audio_file, audio_path)
+    tail: Path | None = None
+    try:
+        with wave.open(str(snapshot), "rb") as source:
+            total_frames = source.getnframes()
+            window_frames = int(seconds * source.getframerate())
+            if total_frames <= window_frames:
+                return snapshot
+            source.setpos(total_frames - window_frames)
+            frames = source.readframes(window_frames)
+            channels = source.getnchannels()
+            sample_width = source.getsampwidth()
+            frame_rate = source.getframerate()
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
+            tail = Path(temporary.name)
+        with wave.open(str(tail), "wb") as output:
+            output.setnchannels(channels)
+            output.setsampwidth(sample_width)
+            output.setframerate(frame_rate)
+            output.writeframes(frames)
+        snapshot.unlink()
+        return tail
+    except (OSError, EOFError, wave.Error) as error:
+        for path in (tail, snapshot):
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        raise BatchTranscriptionError(
+            f"録音中のWAV末尾スナップショットを作成できませんでした: {error}"
+        ) from error
 
 
 def final_transcript_path(realtime_path: Path) -> Path:

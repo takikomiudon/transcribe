@@ -201,6 +201,58 @@ def test_recording_snapshot_is_a_complete_wav() -> None:
             snapshot.unlink()
 
 
+def test_batch_refresh_helpers() -> None:
+    assert transcribe.should_refresh_final(0, 0)
+    assert not transcribe.should_refresh_final(100, 149)
+    assert transcribe.should_refresh_final(100, 150)
+    assert transcribe.should_refresh_final(100, 151)
+
+    assert transcribe.merge_glossary(
+        ["既存語", "共通語", "古い語"],
+        ["新出語", "共通語", "新出語"],
+        limit=4,
+    ) == ["新出語", "共通語", "既存語", "古い語"]
+    assert transcribe.merge_glossary(
+        ["既存語", "古い語"], ["新出語"], limit=2
+    ) == ["新出語", "既存語"]
+
+
+def test_recording_tail_snapshot_is_a_valid_wav() -> None:
+    frames = b"\x01\x00\x02\x00\x03\x00\x04\x00"
+    with tempfile.TemporaryDirectory() as directory:
+        audio_path = Path(directory) / "recording.wav"
+        with (
+            audio_path.open("xb") as audio_file,
+            wave.open(audio_file, "wb") as recording,
+        ):
+            recording.setnchannels(1)
+            recording.setsampwidth(2)
+            recording.setframerate(transcribe.SAMPLE_RATE)
+            recording.writeframesraw(frames)
+
+            tail = transcribe.snapshot_recording_tail(
+                recording,
+                audio_file,
+                audio_path,
+                2 / transcribe.SAMPLE_RATE,
+            )
+            with wave.open(str(tail), "rb") as saved:
+                assert saved.getnchannels() == 1
+                assert saved.getsampwidth() == 2
+                assert saved.getframerate() == transcribe.SAMPLE_RATE
+                assert saved.getnframes() == 2
+                assert saved.readframes(2) == frames[-4:]
+            tail.unlink()
+
+            complete = transcribe.snapshot_recording_tail(
+                recording, audio_file, audio_path, seconds=1
+            )
+            with wave.open(str(complete), "rb") as saved:
+                assert saved.getnframes() == 4
+                assert saved.readframes(4) == frames
+            complete.unlink()
+
+
 async def test_periodic_batch_refresh_retries_without_overlap() -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -1245,6 +1297,8 @@ def main() -> None:
     test_batch_transcription_request_and_output()
     test_batch_transcription_errors_are_user_facing()
     test_recording_snapshot_is_a_complete_wav()
+    test_batch_refresh_helpers()
+    test_recording_tail_snapshot_is_a_valid_wav()
     asyncio.run(test_periodic_batch_refresh_retries_without_overlap())
     asyncio.run(test_periodic_batch_failure_keeps_previous_final())
     asyncio.run(test_periodic_batch_refresh_updates_correction_glossary())
