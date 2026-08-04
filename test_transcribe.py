@@ -1103,7 +1103,7 @@ async def test_websocket_error_preserves_completed_output() -> None:
     assert written == ["Saved."]
 
 
-async def test_partial_display_and_provider_error_events() -> None:
+async def test_realtime_text_is_hidden_and_provider_error_events() -> None:
     class FakeWebSocket:
         def __init__(self, messages: list[str]) -> None:
             self.source = messages
@@ -1137,7 +1137,7 @@ async def test_partial_display_and_provider_error_events() -> None:
             pass
         else:
             raise AssertionError("TranscriptionError was not raised")
-    assert output.getvalue() == "\r\033[2KHel\r\033[2KHello\n"
+    assert output.getvalue() == ""
     assert written == ["Hello"]
 
     for event_type in (
@@ -1275,6 +1275,7 @@ async def test_corrected_text_reaches_all_outputs() -> None:
     with tempfile.TemporaryDirectory() as directory:
         transcript_path = Path(directory) / "transcript.md"
         recording_path = Path(directory) / "recording.wav"
+        terminal = io.StringIO()
         with (
             patch.dict(
                 sys.modules,
@@ -1308,6 +1309,7 @@ async def test_corrected_text_reaches_all_outputs() -> None:
             patch(
                 "transcribe.translate_to_japanese", return_value="日本語訳"
             ) as translate,
+            redirect_stdout(terminal),
         ):
             result = await transcribe.run_transcription(
                 0,
@@ -1341,6 +1343,8 @@ async def test_corrected_text_reaches_all_outputs() -> None:
     assert "Corrected text" in saved
     assert "Original text" not in saved
     assert "日本語訳" in saved
+    assert "Corrected text\n" in terminal.getvalue()
+    assert "Original text" not in terminal.getvalue()
     assert connect_calls[0][0] == (transcribe.realtime_url(),)
     assert connect_calls[0][1]["additional_headers"] == {
         "xi-api-key": "eleven-key"
@@ -1398,7 +1402,7 @@ def main() -> None:
     test_final_cards_replace_live_artifacts_only_on_success()
     asyncio.run(test_capture_eof_and_process_cleanup())
     asyncio.run(test_websocket_error_preserves_completed_output())
-    asyncio.run(test_partial_display_and_provider_error_events())
+    asyncio.run(test_realtime_text_is_hidden_and_provider_error_events())
     asyncio.run(test_corrected_text_reaches_all_outputs())
     print("ok")
 

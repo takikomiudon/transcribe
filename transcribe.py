@@ -795,11 +795,7 @@ async def receive_events(
                 error = error.get("message")
             raise RealtimeAPIError(str(error or "Realtime APIでエラーが発生しました。"))
 
-        text, completed = reducer.handle(event)
-        if text:
-            print(f"\r\033[2K{text}", end="\n" if completed else "", flush=True)
-        elif completed:
-            print(flush=True)
+        _, completed = reducer.handle(event)
         for ready_text in reducer.take_ready():
             if finalize_text is not None:
                 await finalize_text(ready_text)
@@ -965,6 +961,7 @@ async def run_transcription(
                     transcript.flush()
 
                 async def finalize_text(text: str) -> None:
+                    print(text, flush=True)
                     write_final(text)
                     if pipeline is not None:
                         try:

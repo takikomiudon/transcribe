@@ -46,7 +46,7 @@ uv run transcribe.py --list-devices
 uv run transcribe.py --device 0
 ```
 
-途中結果とRealtimeの確定行は速報性を優先して生のままターミナルへ表示されます。確定結果は直前500文字の文脈とbatch版から収穫した用語集を使ってOpenAIで補正され、`transcripts/YYYYMMDD-HHMMSS.md` へ受信順に保存されます。ブラウザにはScribe v2による精度重視の全文が表示され、最初の30秒と、録音量が前回の全文更新時の1.5倍に達した時点で更新されます。終了は `Ctrl-C` です。
+Realtimeの生テキストは表示せず、直前500文字の文脈とbatch版から収穫した用語集を使ってOpenAIで補正した確定結果を、ターミナルへ表示しながら `transcripts/YYYYMMDD-HHMMSS.md` へ受信順に保存します。ブラウザにはScribe v2による精度重視の全文が表示され、最初の30秒と、録音量が前回の全文更新時の1.5倍に達した時点で更新されます。終了は `Ctrl-C` です。
 
 処理中は開始から終了までの全音声を `recordings/YYYYMMDD-HHMMSS.wav` へ保存します。最初の30秒と、録音フレーム数が前回の全文転写時の1.5倍に達した時点で蓄積WAVをElevenLabs Scribe v2へ送り、精度重視の結果で `transcripts/YYYYMMDD-HHMMSS-final.md` を書き直します。それ以外の30秒tickでは、補正用語集の更新に必要な末尾60秒だけを転写し、final本文には使いません。停止時には全WAVで最終更新し、保存に成功するとWAVは自動で削除されます。API通信や保存に失敗した場合は、直前のfinalと再試行用WAVが残ります。
 
