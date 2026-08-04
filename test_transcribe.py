@@ -260,6 +260,8 @@ async def test_periodic_batch_refresh_retries_without_overlap() -> None:
     maximum_active = 0
     attempts = 0
     snapshots: list[Path] = []
+    recording = MagicMock()
+    recording.tell.side_effect = [100, 100]
 
     def make_snapshot(*_: object) -> Path:
         temporary = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
@@ -283,13 +285,16 @@ async def test_periodic_batch_refresh_retries_without_overlap() -> None:
     with tempfile.TemporaryDirectory() as directory:
         realtime_path = Path(directory) / "session.md"
         with (
-            patch("transcribe.snapshot_recording", side_effect=make_snapshot),
+            patch(
+                "transcribe.snapshot_recording", side_effect=make_snapshot
+            ) as full_snapshot,
+            patch("transcribe.snapshot_recording_tail") as tail_snapshot,
             patch("transcribe.batch_transcribe", side_effect=transcribe_snapshot),
         ):
             await transcribe.periodically_refresh_final(
                 realtime_path,
                 Path("recording.wav"),
-                object(),
+                recording,
                 object(),
                 "secret-key",
                 "/usr/bin/curl",
@@ -302,6 +307,8 @@ async def test_periodic_batch_refresh_retries_without_overlap() -> None:
 
     assert attempts == 2
     assert maximum_active == 1
+    assert full_snapshot.call_count == 2
+    tail_snapshot.assert_not_called()
     assert all(not snapshot.exists() for snapshot in snapshots)
 
 
@@ -311,6 +318,8 @@ async def test_periodic_batch_failure_keeps_previous_final() -> None:
     temporary = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     temporary.close()
     snapshot = Path(temporary.name)
+    recording = MagicMock()
+    recording.tell.return_value = 100
 
     def fail(*_: object) -> str:
         loop.call_soon_threadsafe(stop_event.set)
@@ -327,7 +336,7 @@ async def test_periodic_batch_failure_keeps_previous_final() -> None:
             await transcribe.periodically_refresh_final(
                 realtime_path,
                 Path("recording.wav"),
-                object(),
+                recording,
                 object(),
                 "secret-key",
                 "/usr/bin/curl",
@@ -347,6 +356,8 @@ async def test_periodic_batch_refresh_updates_correction_glossary() -> None:
     snapshot = Path(temporary.name)
     transcript = "前" * 4_100 + "セブンイレブンとOpenAI"
     glossary = ["古い用語"]
+    recording = MagicMock()
+    recording.tell.return_value = 100
 
     def transcribe_snapshot(*_: object) -> str:
         loop.call_soon_threadsafe(stop_event.set)
@@ -389,7 +400,7 @@ async def test_periodic_batch_refresh_updates_correction_glossary() -> None:
             await transcribe.periodically_refresh_final(
                 realtime_path,
                 Path("recording.wav"),
-                object(),
+                recording,
                 object(),
                 "eleven-key",
                 "/usr/bin/curl",
@@ -399,7 +410,7 @@ async def test_periodic_batch_refresh_updates_correction_glossary() -> None:
                 openai_api_key="openai-key",
             )
 
-    assert glossary == ["セブンイレブン", "OpenAI"]
+    assert glossary == ["セブンイレブン", "OpenAI", "古い用語"]
     request = urlopen.call_args.args[0]
     payload = json.loads(request.data)
     assert payload["input"] == transcript[-4_000:]
@@ -428,7 +439,133 @@ async def test_periodic_batch_refresh_updates_correction_glossary() -> None:
         await queue.join()
         await worker
 
-    assert received_glossaries == [["セブンイレブン", "OpenAI"]]
+    assert received_glossaries == [["セブンイレブン", "OpenAI", "古い用語"]]
+
+
+async def test_periodic_batch_refresh_uses_growth_and_tail_windows() -> None:
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    recording = MagicMock()
+    recording.tell.side_effect = [100, 149, 150, 224, 225]
+    glossary = ["既存語"]
+    snapshots: list[Path] = []
+    transcriptions = iter(
+        ["全文100", "末尾149", "全文150", "末尾224", "全文225"]
+    )
+
+    def make_snapshot(*_: object) -> Path:
+        temporary = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        temporary.close()
+        snapshot = Path(temporary.name)
+        snapshots.append(snapshot)
+        return snapshot
+
+    def transcribe_snapshot(*_: object) -> str:
+        text = next(transcriptions)
+        if text == "全文225":
+            loop.call_soon_threadsafe(stop_event.set)
+        return text
+
+    with tempfile.TemporaryDirectory() as directory:
+        realtime_path = Path(directory) / "session.md"
+        final_path = transcribe.final_transcript_path(realtime_path)
+        with (
+            patch(
+                "transcribe.snapshot_recording", side_effect=make_snapshot
+            ) as full_snapshot,
+            patch(
+                "transcribe.snapshot_recording_tail", side_effect=make_snapshot
+            ) as tail_snapshot,
+            patch("transcribe.batch_transcribe", side_effect=transcribe_snapshot),
+            patch(
+                "transcribe.extract_glossary",
+                side_effect=lambda text, _: [text],
+            ),
+            patch(
+                "transcribe.write_batch_transcript", return_value=final_path
+            ) as write_final,
+        ):
+            await transcribe.periodically_refresh_final(
+                realtime_path,
+                Path("recording.wav"),
+                recording,
+                object(),
+                "eleven-key",
+                "/usr/bin/curl",
+                stop_event,
+                interval_seconds=0.01,
+                glossary=glossary,
+                openai_api_key="openai-key",
+            )
+
+    assert full_snapshot.call_count == 3
+    assert tail_snapshot.call_count == 2
+    assert all(value.args[3] == 60 for value in tail_snapshot.call_args_list)
+    assert [value.args[1] for value in write_final.call_args_list] == [
+        "全文100",
+        "全文150",
+        "全文225",
+    ]
+    assert glossary == [
+        "全文225",
+        "末尾224",
+        "全文150",
+        "末尾149",
+        "全文100",
+        "既存語",
+    ]
+    assert all(not snapshot.exists() for snapshot in snapshots)
+
+
+async def test_periodic_batch_skips_tail_without_glossary() -> None:
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    recording = MagicMock()
+    frame_counts = iter([100, 149])
+    batch_calls = 0
+    snapshots: list[Path] = []
+
+    def current_frames() -> int:
+        value = next(frame_counts)
+        if value == 149:
+            loop.call_soon(stop_event.set)
+        return value
+
+    def make_snapshot(*_: object) -> Path:
+        temporary = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        temporary.close()
+        snapshot = Path(temporary.name)
+        snapshots.append(snapshot)
+        return snapshot
+
+    def transcribe_snapshot(*_: object) -> str:
+        nonlocal batch_calls
+        batch_calls += 1
+        if batch_calls == 2:
+            loop.call_soon_threadsafe(stop_event.set)
+        return "全文"
+
+    recording.tell.side_effect = current_frames
+    with tempfile.TemporaryDirectory() as directory:
+        with (
+            patch("transcribe.snapshot_recording", side_effect=make_snapshot),
+            patch("transcribe.snapshot_recording_tail") as tail_snapshot,
+            patch("transcribe.batch_transcribe", side_effect=transcribe_snapshot),
+        ):
+            await transcribe.periodically_refresh_final(
+                Path(directory) / "session.md",
+                Path("recording.wav"),
+                recording,
+                object(),
+                "eleven-key",
+                "/usr/bin/curl",
+                stop_event,
+                interval_seconds=0.01,
+            )
+
+    assert batch_calls == 1
+    tail_snapshot.assert_not_called()
+    assert all(not snapshot.exists() for snapshot in snapshots)
 
 
 async def test_correction_worker_preserves_original_and_order() -> None:
@@ -1302,6 +1439,8 @@ def main() -> None:
     asyncio.run(test_periodic_batch_refresh_retries_without_overlap())
     asyncio.run(test_periodic_batch_failure_keeps_previous_final())
     asyncio.run(test_periodic_batch_refresh_updates_correction_glossary())
+    asyncio.run(test_periodic_batch_refresh_uses_growth_and_tail_windows())
+    asyncio.run(test_periodic_batch_skips_tail_without_glossary())
     asyncio.run(test_correction_worker_preserves_original_and_order())
     test_completed_batch_is_saved_before_recording_is_deleted()
     test_batch_or_save_failure_preserves_recording()

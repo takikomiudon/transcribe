@@ -594,6 +594,7 @@ async def periodically_refresh_final(
 ) -> None:
     loop = asyncio.get_running_loop()
     next_refresh = loop.time() + interval_seconds
+    last_full_frames = 0
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(
@@ -603,37 +604,52 @@ async def periodically_refresh_final(
         except TimeoutError:
             pass
 
-        snapshot: Path | None = None
-        try:
-            snapshot = snapshot_recording(recording, audio_file, audio_path)
-            text = await asyncio.to_thread(batch_transcribe, snapshot, api_key, curl)
-            output_path = write_batch_transcript(realtime_path, text)
-            print(f"final更新: {output_path}", flush=True)
-            if glossary is not None:
-                try:
-                    updated = await asyncio.to_thread(
-                        extract_glossary, text, openai_api_key
-                    )
-                except Exception as error:
-                    print(
-                        f"[補正] 警告: 用語集を更新できません: {error}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+        current_frames = recording.tell()
+        refresh_final = should_refresh_final(last_full_frames, current_frames)
+        if refresh_final or glossary is not None:
+            snapshot: Path | None = None
+            try:
+                if refresh_final:
+                    snapshot = snapshot_recording(recording, audio_file, audio_path)
                 else:
-                    glossary[:] = updated
-        except BatchTranscriptionError as error:
-            print(f"[batch] 警告: {error}", file=sys.stderr, flush=True)
-        finally:
-            if snapshot is not None:
-                try:
-                    snapshot.unlink(missing_ok=True)
-                except OSError as error:
-                    print(
-                        f"[batch] 警告: 一時WAVを削除できませんでした: {error}",
-                        file=sys.stderr,
-                        flush=True,
+                    snapshot = snapshot_recording_tail(
+                        recording,
+                        audio_file,
+                        audio_path,
+                        max(GLOSSARY_WINDOW_SECONDS, 2 * interval_seconds),
                     )
+                text = await asyncio.to_thread(
+                    batch_transcribe, snapshot, api_key, curl
+                )
+                if refresh_final:
+                    output_path = write_batch_transcript(realtime_path, text)
+                    last_full_frames = current_frames
+                    print(f"final更新: {output_path}", flush=True)
+                if glossary is not None:
+                    try:
+                        updated = await asyncio.to_thread(
+                            extract_glossary, text, openai_api_key
+                        )
+                    except Exception as error:
+                        print(
+                            f"[補正] 警告: 用語集を更新できません: {error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    else:
+                        glossary[:] = merge_glossary(glossary, updated)
+            except BatchTranscriptionError as error:
+                print(f"[batch] 警告: {error}", file=sys.stderr, flush=True)
+            finally:
+                if snapshot is not None:
+                    try:
+                        snapshot.unlink(missing_ok=True)
+                    except OSError as error:
+                        print(
+                            f"[batch] 警告: 一時WAVを削除できませんでした: {error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
 
         while next_refresh <= loop.time():
             next_refresh += interval_seconds
