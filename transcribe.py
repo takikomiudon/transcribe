@@ -141,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=port_number,
         default=8765,
         metavar="PORT",
-        help="図解ビューアのポート（既定: 8765）",
+        help="ビューアのポート（既定: 8765）",
     )
     parser.add_argument(
         "--cards-character-threshold",
@@ -701,25 +701,6 @@ async def run_transcription(
         except Exception as error:
             print(f"[cards] 警告: 図解保存を開始できません: {error}", file=sys.stderr)
             pipeline = None
-        if pipeline is not None:
-            try:
-                viewer_server = ViewerServer(pipeline.json_path, cards_port)
-                viewer_server.start()
-                print(f"図解ビューア: {viewer_server.url}")
-            except OSError as error:
-                print(
-                    f"[cards] 警告: 図解ビューアを開始できません: {error}",
-                    file=sys.stderr,
-                )
-                viewer_server = None
-            else:
-                try:
-                    subprocess.run(["open", viewer_server.url], check=False)
-                except OSError as error:
-                    print(
-                        f"[cards] 警告: ブラウザを開けません: {error}",
-                        file=sys.stderr,
-                    )
 
     try:
         async with connect(
@@ -735,6 +716,28 @@ async def run_transcription(
 
             output_path = transcript_path()
             audio_path = recording_path(output_path)
+            try:
+                viewer_server = ViewerServer(
+                    final_transcript_path(output_path),
+                    pipeline.json_path if pipeline is not None else None,
+                    cards_port,
+                )
+                viewer_server.start()
+                print(f"ビューア: {viewer_server.url}")
+            except OSError as error:
+                print(
+                    f"警告: ビューアを開始できません: {error}",
+                    file=sys.stderr,
+                )
+                viewer_server = None
+            else:
+                try:
+                    subprocess.run(["open", viewer_server.url], check=False)
+                except OSError as error:
+                    print(
+                        f"警告: ブラウザを開けません: {error}",
+                        file=sys.stderr,
+                    )
             with (
                 audio_path.open("xb") as audio_file,
                 wave.open(audio_file, "wb") as recording,
@@ -870,7 +873,7 @@ async def run_transcription(
                 viewer_server.stop()
             except OSError as error:
                 print(
-                    f"[cards] 警告: 図解ビューアを停止できません: {error}",
+                    f"警告: ビューアを停止できません: {error}",
                     file=sys.stderr,
                 )
         loop.remove_signal_handler(signal.SIGINT)

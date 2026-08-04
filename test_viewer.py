@@ -26,22 +26,35 @@ def sample_card() -> Card:
 
 def test_viewer_server_routes() -> None:
     with tempfile.TemporaryDirectory() as directory:
+        transcript_path = Path(directory) / "session-final.md"
         cards_path = Path(directory) / "cards.json"
         cards_path.write_text(
             json.dumps([asdict(sample_card())]), encoding="utf-8"
         )
-        server = viewer.ViewerServer(cards_path, port=0)
+        server = viewer.ViewerServer(transcript_path, cards_path, port=0)
         server.start()
         try:
             with urllib.request.urlopen(server.url, timeout=2) as response:
                 page = response.read().decode()
                 assert response.headers.get_content_type() == "text/html"
             with urllib.request.urlopen(
+                f"{server.url}/transcript", timeout=2
+            ) as response:
+                assert response.read() == b""
+
+            transcript_path.write_text("# Final\n\nAccurate text.", encoding="utf-8")
+            with urllib.request.urlopen(
+                f"{server.url}/transcript", timeout=2
+            ) as response:
+                transcript = response.read().decode()
+                assert response.headers.get_content_type() == "text/plain"
+            with urllib.request.urlopen(
                 f"{server.url}/cards", timeout=2
             ) as response:
                 payload = json.loads(response.read())
                 assert response.headers.get("Cache-Control") == "no-store"
             assert "Realtime Diagram Cards" in page
+            assert transcript == "# Final\n\nAccurate text."
             assert payload[0]["title"] == "Overview"
 
             try:
@@ -54,9 +67,31 @@ def test_viewer_server_routes() -> None:
             server.stop()
 
 
+def test_viewer_without_cards() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        transcript_path = Path(directory) / "session-final.md"
+        server = viewer.ViewerServer(transcript_path, port=0)
+        server.start()
+        try:
+            with urllib.request.urlopen(server.url, timeout=2) as response:
+                page = response.read().decode()
+            with urllib.request.urlopen(
+                f"{server.url}/cards", timeout=2
+            ) as response:
+                assert json.loads(response.read()) == []
+        finally:
+            server.stop()
+
+    assert "const CARDS_ENABLED = false;" in page
+
+
 def test_viewer_page_behavior_and_export() -> None:
     page = viewer.viewer_page()
-    assert "setInterval(refresh, 2000)" in page
+    assert 'fetch("/transcript", {cache: "no-store"})' in page
+    assert "if (text === transcriptVersion) return" in page
+    assert "transcript.textContent = text" in page
+    assert "setInterval(refreshTranscript, 2000)" in page
+    assert "setInterval(refreshCards, 2000)" in page
     assert "source.textContent = card.source_text" in page
     assert "const atBottom" in page
     assert "existing.replaceWith(element)" in page
@@ -72,12 +107,14 @@ def test_viewer_page_behavior_and_export() -> None:
         exported = output_path.read_text(encoding="utf-8")
 
     assert "const INITIAL_CARDS = [" in exported
+    assert "const TRANSCRIPT_ENABLED = false;" in exported
     assert "\\u003c/script>" in exported
-    assert "if (INITIAL_CARDS === null)" in exported
+    assert "if (CARDS_ENABLED && INITIAL_CARDS === null)" in exported
 
 
 def main() -> None:
     test_viewer_server_routes()
+    test_viewer_without_cards()
     test_viewer_page_behavior_and_export()
     print("ok")
 

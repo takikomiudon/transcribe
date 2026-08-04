@@ -726,7 +726,13 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
             return []
 
     class FakeViewer:
-        def __init__(self, cards_path: Path, port: int) -> None:
+        def __init__(
+            self,
+            transcript_path: Path,
+            cards_path: Path | None,
+            port: int,
+        ) -> None:
+            self.transcript_path = transcript_path
             self.cards_path = cards_path
             self.port = port
             self.url = f"http://127.0.0.1:{port}"
@@ -866,6 +872,9 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
     assert pipeline.texts == ["Original text"]
     assert pipeline.closed
     viewer = viewer_instances[0]
+    assert viewer.transcript_path == transcribe.final_transcript_path(
+        transcript_path
+    )
     assert viewer.cards_path == pipeline.json_path
     assert viewer.started
     assert viewer.stopped

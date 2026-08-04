@@ -1,6 +1,6 @@
 # Minimal Realtime Transcription CLI
 
-macOSの日本語・英語・韓国語音声をElevenLabs Scribe Realtimeでリアルタイム文字起こしし、終了後にセッション全体をElevenLabs Scribe v2でも一括文字起こしする最小CLIです。日本語を主言語、英語・韓国語を副言語として認識します。
+macOSの日本語・英語・韓国語音声をElevenLabs Scribe Realtimeでリアルタイム文字起こしし、録音中はセッション全体をElevenLabs Scribe v2で30秒ごとに再文字起こしする最小CLIです。日本語を主言語、英語・韓国語を副言語として認識します。
 
 ## 必要なもの
 
@@ -46,9 +46,11 @@ uv run transcribe.py --list-devices
 uv run transcribe.py --device 0
 ```
 
-途中結果はターミナルへ表示され、確定結果は `transcripts/YYYYMMDD-HHMMSS.md` へ逐次保存されます。終了は `Ctrl-C` です。
+途中結果はターミナルへ表示され、Realtimeの確定結果は速報ログとして `transcripts/YYYYMMDD-HHMMSS.md` へ逐次保存されます。ブラウザにはScribe v2による精度重視の全文が表示され、30秒ごとに更新されます。終了は `Ctrl-C` です。
 
-処理中は開始から終了までの全音声を `recordings/YYYYMMDD-HHMMSS.wav` へ保存します。終了後、このWAVをElevenLabs Scribe v2へ送り、精度重視の結果を `transcripts/YYYYMMDD-HHMMSS-final.md` へ保存します。最終Markdownの保存に成功するとWAVは自動で削除され、API通信や保存に失敗した場合は再試行できるよう残ります。リアルタイム処理と終了後の一括処理はそれぞれElevenLabsの利用料金が発生します。
+処理中は開始から終了までの全音声を `recordings/YYYYMMDD-HHMMSS.wav` へ保存します。この蓄積WAVを30秒ごとにElevenLabs Scribe v2へ送り、精度重視の結果で `transcripts/YYYYMMDD-HHMMSS-final.md` を書き直します。停止時にも全WAVで最終更新し、保存に成功するとWAVは自動で削除されます。API通信や保存に失敗した場合は、直前のfinalと再試行用WAVが残ります。
+
+更新間隔は `--batch-refresh-seconds 60` のように変更できます。毎回セッション全体を送り直すため処理量は録音時間に対して累積し、60分の録音を30秒間隔で更新すると周期更新だけで約60.5時間分の音声処理になります。Realtime、各周期更新、停止時の最終更新にはそれぞれElevenLabsの利用料金が発生します。
 
 英語・韓国語の確定結果を日本語でも保存する場合は、`--translate-ja` を追加します。原文の文字起こしにはElevenLabs Scribe Realtime、日本語訳にはOpenAI `gpt-5.6-luna` を使用するため、翻訳分のAPI料金が別途かかります。
 
@@ -56,13 +58,13 @@ uv run transcribe.py --device 0
 uv run transcribe.py --device 0 --translate-ja
 ```
 
-確定した発話からOpenAIで話題ごとの図解カードを生成する場合は、`--cards` を追加します。ブラウザでローカルビューアが開き、カードが下へ追加されます。終了時には同じ内容を `cards_output/YYYYMMDD-HHMMSS.html` とJSONへ保存します。
+確定した発話からOpenAIで話題ごとの図解カードを生成する場合は、`--cards` を追加します。通常の文字起こしでも開くローカルビューアにカードが追加され、終了時には同じ内容を `cards_output/YYYYMMDD-HHMMSS.html` とJSONへ保存します。
 
 ```sh
 uv run transcribe.py --device 0 --cards
 ```
 
-生成は既定で300文字、20秒間の新規発話なし、または前回生成から90秒のいずれかで始まります。必要なら `--cards-character-threshold`、`--cards-idle-seconds`、`--cards-max-seconds` で調整し、ポート競合時は `--cards-port` を変更できます。`--translate-ja` と同時指定した場合も、図解には翻訳前の原文を使います。
+生成は既定で300文字、20秒間の新規発話なし、または前回生成から90秒のいずれかで始まります。必要なら `--cards-character-threshold`、`--cards-idle-seconds`、`--cards-max-seconds` で調整し、ビューアのポート競合時は `--cards-port` を変更できます。`--translate-ja` と同時指定した場合も、図解には翻訳前の原文を使います。
 
 音声は無音を含め、16kHz PCMを100ms単位で常時送信します。発話の確定はElevenLabs側のVADに任せ、800msの無音で区切ります。終了時は100ms未満の残りも送信して確定します。
 

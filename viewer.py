@@ -18,7 +18,7 @@ VIEWER_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'">
-<title>Realtime Diagram Cards</title>
+<title>Realtime Transcription</title>
 <style>
 :root {
   color-scheme: light;
@@ -44,6 +44,20 @@ main { width: min(920px, calc(100% - 32px)); margin: 0 auto; padding: 48px 0 80p
 .page-header { margin-bottom: 28px; }
 .page-header p { margin: 4px 0 0; color: var(--muted); }
 h1 { margin: 0; font-size: clamp(1.65rem, 4vw, 2.25rem); letter-spacing: -.03em; }
+.panel { margin-bottom: 28px; }
+.panel > h2 { margin: 0 0 12px; font-size: 1.25rem; }
+.transcript {
+  min-height: 140px;
+  margin: 0;
+  padding: 20px 24px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: 0 8px 24px rgb(24 32 42 / 6%);
+  color: var(--text);
+  font: inherit;
+  white-space: pre-wrap;
+}
 .cards { display: grid; gap: 20px; }
 .card {
   overflow: hidden;
@@ -83,7 +97,7 @@ th { background: var(--soft); }
 details { border-top: 1px solid var(--line); }
 summary { cursor: pointer; padding: 12px 24px; color: var(--muted); font-size: .88rem; }
 summary:focus-visible { outline: 3px solid rgb(49 95 202 / 35%); outline-offset: -3px; }
-pre { margin: 0; padding: 0 24px 20px; color: var(--muted); font: inherit; white-space: pre-wrap; }
+details pre { margin: 0; padding: 0 24px 20px; color: var(--muted); font: inherit; white-space: pre-wrap; }
 .empty { padding: 32px; border: 1px dashed var(--line); border-radius: 12px; color: var(--muted); text-align: center; }
 @media (max-width: 620px) {
   main { width: min(100% - 20px, 920px); padding-top: 28px; }
@@ -96,15 +110,28 @@ pre { margin: 0; padding: 0 24px 20px; color: var(--muted); font: inherit; white
 <body>
 <main>
   <header class="page-header">
-    <h1>Realtime Diagram Cards</h1>
-    <p>文字起こしから話題ごとの図解を生成しています。</p>
+    <h1>Realtime Transcription</h1>
+    <p>Scribe v2による精度重視の全文を自動更新しています。</p>
   </header>
-  <div id="cards" class="cards" aria-live="polite"><p class="empty">カードを待っています。</p></div>
+  <section id="transcript-section" class="panel" aria-labelledby="transcript-heading">
+    <h2 id="transcript-heading">Final Transcript</h2>
+    <pre id="transcript" class="transcript" aria-live="polite">最初の文字起こしを待っています。</pre>
+  </section>
+  <section id="cards-section" class="panel" aria-labelledby="cards-heading">
+    <h2 id="cards-heading">Realtime Diagram Cards</h2>
+    <div id="cards" class="cards" aria-live="polite"><p class="empty">カードを待っています。</p></div>
+  </section>
 </main>
 <script>
 const INITIAL_CARDS = null;
+const CARDS_ENABLED = true;
+const TRANSCRIPT_ENABLED = true;
+const transcriptSection = document.getElementById("transcript-section");
+const transcript = document.getElementById("transcript");
+const cardsSection = document.getElementById("cards-section");
 const root = document.getElementById("cards");
 const versions = new Map();
+let transcriptVersion = "";
 
 function cardElement(card) {
   const article = document.createElement("article");
@@ -145,7 +172,20 @@ function render(cards) {
   if (atBottom) requestAnimationFrame(() => window.scrollTo({top: document.documentElement.scrollHeight, behavior: "smooth"}));
 }
 
-async function refresh() {
+async function refreshTranscript() {
+  try {
+    const response = await fetch("/transcript", {cache: "no-store"});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const text = await response.text();
+    if (text === transcriptVersion) return;
+    transcriptVersion = text;
+    transcript.textContent = text || "最初の文字起こしを待っています。";
+  } catch (error) {
+    console.warn("文字起こしを取得できません", error);
+  }
+}
+
+async function refreshCards() {
   try {
     const response = await fetch("/cards", {cache: "no-store"});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -155,21 +195,38 @@ async function refresh() {
   }
 }
 
-if (INITIAL_CARDS === null) {
-  refresh();
-  setInterval(refresh, 2000);
-} else {
+if (TRANSCRIPT_ENABLED) {
+  refreshTranscript();
+  setInterval(refreshTranscript, 2000);
+} else transcriptSection.hidden = true;
+
+if (CARDS_ENABLED && INITIAL_CARDS === null) {
+  refreshCards();
+  setInterval(refreshCards, 2000);
+} else if (CARDS_ENABLED) {
   render(INITIAL_CARDS);
-}
+} else cardsSection.hidden = true;
 </script>
 </body>
 </html>
 """
 
 
-def viewer_page(cards: list[Card] | None = None) -> str:
+def viewer_page(
+    cards: list[Card] | None = None,
+    *,
+    cards_enabled: bool = True,
+    transcript_enabled: bool = True,
+) -> str:
+    page = VIEWER_HTML.replace(
+        "const CARDS_ENABLED = true;",
+        f"const CARDS_ENABLED = {str(cards_enabled).lower()};",
+    ).replace(
+        "const TRANSCRIPT_ENABLED = true;",
+        f"const TRANSCRIPT_ENABLED = {str(transcript_enabled).lower()};",
+    )
     if cards is None:
-        return VIEWER_HTML
+        return page
     initial_cards = json.dumps(
         [asdict(card) for card in cards], ensure_ascii=False, separators=(",", ":")
     )
@@ -178,33 +235,53 @@ def viewer_page(cards: list[Card] | None = None) -> str:
         .replace("\u2028", "\\u2028")
         .replace("\u2029", "\\u2029")
     )
-    return VIEWER_HTML.replace(
+    return page.replace(
         "const INITIAL_CARDS = null;", f"const INITIAL_CARDS = {initial_cards};"
     )
 
 
 def export_cards(cards: list[Card], output_path: Path) -> Path:
-    output_path.write_text(viewer_page(cards), encoding="utf-8")
+    output_path.write_text(
+        viewer_page(cards, transcript_enabled=False), encoding="utf-8"
+    )
     return output_path
 
 
 class ViewerServer:
-    def __init__(self, cards_path: Path, port: int = 8765) -> None:
+    def __init__(
+        self,
+        transcript_path: Path,
+        cards_path: Path | None = None,
+        port: int = 8765,
+    ) -> None:
+        self.transcript_path = transcript_path
         self.cards_path = cards_path
         self.thread: threading.Thread | None = None
+        transcript_file = self.transcript_path
         cards_file = self.cards_path
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 path = urlsplit(self.path).path
                 if path == "/":
-                    self._send(200, "text/html; charset=utf-8", viewer_page().encode())
+                    page = viewer_page(cards_enabled=cards_file is not None)
+                    self._send(200, "text/html; charset=utf-8", page.encode())
+                    return
+                if path == "/transcript":
+                    try:
+                        body = transcript_file.read_bytes()
+                    except FileNotFoundError:
+                        body = b""
+                    self._send(200, "text/plain; charset=utf-8", body)
                     return
                 if path == "/cards":
-                    try:
-                        body = cards_file.read_bytes()
-                    except FileNotFoundError:
+                    if cards_file is None:
                         body = b"[]"
+                    else:
+                        try:
+                            body = cards_file.read_bytes()
+                        except FileNotFoundError:
+                            body = b"[]"
                     self._send(200, "application/json; charset=utf-8", body)
                     return
                 self._send(404, "text/plain; charset=utf-8", "Not found".encode())
