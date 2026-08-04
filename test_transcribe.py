@@ -542,7 +542,11 @@ def test_translation_flag() -> None:
         ["--device", "0", "--translate-ja"]
     )
     assert args.translate_ja
+    assert not args.no_correction
     assert "silence_threshold" not in vars(args)
+
+    args = transcribe.build_parser().parse_args(["--device", "0", "--no-correction"])
+    assert args.no_correction
 
 
 def test_cards_flags() -> None:
@@ -684,7 +688,7 @@ def test_missing_key_stops_before_capture() -> None:
     assert "ELEVENLABS_API_KEY" in stderr.getvalue()
 
 
-def test_openai_key_is_only_required_for_openai_features() -> None:
+def test_openai_key_is_required_unless_correction_is_disabled() -> None:
     output_path = Path("transcripts/result.md")
     audio_path = Path("recordings/result.wav")
     final_path = Path("transcripts/result-final.md")
@@ -712,7 +716,7 @@ def test_openai_key_is_only_required_for_openai_features() -> None:
             return_value=(final_path, "Final transcript."),
         ) as finalize,
     ):
-        assert transcribe.main(["--device", "0"]) == 0
+        assert transcribe.main(["--device", "0", "--no-correction"]) == 0
     run.assert_called_once_with("coroutine")
     assert run_job.call_args.args[:4] == (
         0,
@@ -725,6 +729,7 @@ def test_openai_key_is_only_required_for_openai_features() -> None:
         run_job.call_args.kwargs["batch_refresh_seconds"]
         == transcribe.BATCH_REFRESH_SECONDS
     )
+    assert run_job.call_args.kwargs["correction_enabled"] is False
     finalize.assert_called_once_with(
         output_path,
         audio_path,
@@ -732,7 +737,11 @@ def test_openai_key_is_only_required_for_openai_features() -> None:
         "/usr/bin/curl",
     )
 
-    for feature in ("--translate-ja", "--cards"):
+    for options in (
+        [],
+        ["--no-correction", "--translate-ja"],
+        ["--no-correction", "--cards"],
+    ):
         stderr = io.StringIO()
         with (
             patch("transcribe.shutil.which", return_value="/usr/local/bin/ffmpeg"),
@@ -740,7 +749,7 @@ def test_openai_key_is_only_required_for_openai_features() -> None:
             patch("transcribe.asyncio.run") as run,
             redirect_stderr(stderr),
         ):
-            assert transcribe.main(["--device", "0", feature]) == 2
+            assert transcribe.main(["--device", "0", *options]) == 2
         run.assert_not_called()
         assert "OPENAI_API_KEY" in stderr.getvalue()
 
@@ -1007,7 +1016,7 @@ async def test_partial_display_and_provider_error_events() -> None:
             raise AssertionError(f"{event_type} was not raised")
 
 
-async def test_cards_receive_original_text_and_close_with_translation() -> None:
+async def test_corrected_text_reaches_all_outputs_and_can_be_disabled() -> None:
     pipeline_instances: list[FakePipeline] = []
     viewer_instances: list[FakeViewer] = []
 
@@ -1101,18 +1110,24 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
 
     async def fake_receive(
         _: object,
-        __: object,
+        reducer: transcribe.TranscriptReducer,
         ___: asyncio.Event,
         finalize_text: object,
     ) -> None:
-        assert callable(finalize_text)
-        await finalize_text("Original text")
+        if callable(finalize_text):
+            await finalize_text("Original text")
+        else:
+            reducer.handle(
+                {"message_type": "committed_transcript", "text": "Original text"}
+            )
         finalized.set()
         await asyncio.Event().wait()
 
     with tempfile.TemporaryDirectory() as directory:
         transcript_path = Path(directory) / "transcript.md"
         recording_path = Path(directory) / "recording.wav"
+        raw_transcript_path = Path(directory) / "raw-transcript.md"
+        raw_recording_path = Path(directory) / "raw-recording.wav"
         with (
             patch.dict(
                 sys.modules,
@@ -1132,8 +1147,17 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
             ),
             patch("transcribe.stream_audio", fake_stream),
             patch("transcribe.receive_events", fake_receive),
-            patch("transcribe.transcript_path", return_value=transcript_path),
-            patch("transcribe.recording_path", return_value=recording_path),
+            patch(
+                "transcribe.transcript_path",
+                side_effect=[transcript_path, raw_transcript_path],
+            ),
+            patch(
+                "transcribe.recording_path",
+                side_effect=[recording_path, raw_recording_path],
+            ),
+            patch(
+                "transcribe.correct_transcript", return_value="Corrected text"
+            ) as correct,
             patch(
                 "transcribe.translate_to_japanese", return_value="日本語訳"
             ) as translate,
@@ -1150,8 +1174,17 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
                 cards_idle_seconds=8,
                 cards_max_seconds=45,
             )
+            finalized = asyncio.Event()
+            raw_result = await transcribe.run_transcription(
+                0,
+                "eleven-key",
+                "",
+                "/usr/bin/ffmpeg",
+                correction_enabled=False,
+            )
 
         saved = transcript_path.read_text(encoding="utf-8")
+        raw_saved = raw_transcript_path.read_text(encoding="utf-8")
         with wave.open(str(recording_path), "rb") as recording:
             assert recording.getnchannels() == 1
             assert recording.getsampwidth() == 2
@@ -1167,13 +1200,23 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
         pipeline_instances[0].html_path,
         viewer_instances[0],
     )
-    assert "Original text" in saved
+    assert raw_result == (
+        raw_transcript_path,
+        raw_recording_path,
+        None,
+        None,
+        viewer_instances[1],
+    )
+    assert "Corrected text" in saved
+    assert "Original text" not in saved
+    assert "Original text" in raw_saved
     assert "日本語訳" in saved
     assert connect_calls[0][0] == (transcribe.realtime_url(),)
     assert connect_calls[0][1]["additional_headers"] == {
         "xi-api-key": "eleven-key"
     }
-    translate.assert_called_once_with("Original text", "openai-key")
+    correct.assert_called_once_with("Original text", "", [], "openai-key")
+    translate.assert_called_once_with("Corrected text", "openai-key")
     pipeline = pipeline_instances[0]
     assert pipeline.api_key == "openai-key"
     assert pipeline.options == {
@@ -1182,7 +1225,7 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
         "max_seconds": 45,
     }
     assert pipeline.started
-    assert pipeline.texts == ["Original text"]
+    assert pipeline.texts == ["Corrected text"]
     assert pipeline.closed
     viewer = viewer_instances[0]
     assert viewer.transcript_path == transcribe.final_transcript_path(
@@ -1191,7 +1234,7 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
     assert viewer.cards_path == pipeline.json_path
     assert viewer.started
     assert not viewer.stopped
-    open_browser.assert_called_once_with(["open", viewer.url], check=False)
+    assert open_browser.call_count == 2
     export_cards.assert_called_once_with([], pipeline.html_path)
 
 
@@ -1221,7 +1264,7 @@ def main() -> None:
     asyncio.run(test_capture_eof_and_process_cleanup())
     asyncio.run(test_websocket_error_preserves_completed_output())
     asyncio.run(test_partial_display_and_provider_error_events())
-    asyncio.run(test_cards_receive_original_text_and_close_with_translation())
+    asyncio.run(test_corrected_text_reaches_all_outputs_and_can_be_disabled())
     print("ok")
 
 

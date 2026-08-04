@@ -1,6 +1,6 @@
 # Minimal Realtime Transcription CLI
 
-macOSの日本語・英語・韓国語音声をElevenLabs Scribe Realtimeでリアルタイム文字起こしし、録音中はセッション全体をElevenLabs Scribe v2で30秒ごとに再文字起こしする最小CLIです。日本語を主言語、英語・韓国語を副言語として認識します。
+macOSの日本語・英語・韓国語音声をElevenLabs Scribe Realtimeでリアルタイム文字起こしし、確定結果をOpenAIで補正する最小CLIです。録音中はセッション全体をElevenLabs Scribe v2でも30秒ごとに再文字起こしします。日本語を主言語、英語・韓国語を副言語として認識します。
 
 ## 必要なもの
 
@@ -9,7 +9,7 @@ macOSの日本語・英語・韓国語音声をElevenLabs Scribe Realtimeでリ�
 - `ffmpeg`
 - `curl`（macOS標準）
 - `ELEVENLABS_API_KEY` を設定した `.env.local`
-- 翻訳または図解を使う場合のみ `OPENAI_API_KEY`
+- 補正・翻訳・図解に使う `OPENAI_API_KEY`
 
 `.env.local` はGit管理外です。APIキーの値をソースコードやコミットへ入れないでください。
 
@@ -28,7 +28,7 @@ Raycastから起動する場合は、使用する音声入力番号も設定で�
 
 ```sh
 ELEVENLABS_API_KEY='your-elevenlabs-api-key'
-OPENAI_API_KEY='your-openai-api-key' # --translate-ja / --cards 使用時のみ
+OPENAI_API_KEY='your-openai-api-key'
 TRANSCRIBE_DEVICE=0
 ```
 
@@ -46,7 +46,13 @@ uv run transcribe.py --list-devices
 uv run transcribe.py --device 0
 ```
 
-途中結果はターミナルへ表示され、Realtimeの確定結果は速報ログとして `transcripts/YYYYMMDD-HHMMSS.md` へ逐次保存されます。ブラウザにはScribe v2による精度重視の全文が表示され、30秒ごとに更新されます。終了は `Ctrl-C` です。
+途中結果とRealtimeの確定行は速報性を優先して生のままターミナルへ表示されます。確定結果は直前500文字の文脈とbatch版から収穫した用語集を使ってOpenAIで補正され、`transcripts/YYYYMMDD-HHMMSS.md` へ受信順に保存されます。ブラウザにはScribe v2による精度重視の全文が表示され、30秒ごとに更新されます。終了は `Ctrl-C` です。
+
+補正を使わず従来どおりRealtimeの確定結果をそのまま保存する場合は、`--no-correction` を追加します。`--translate-ja` と `--cards` も使わない場合、このモードでは `OPENAI_API_KEY` は不要です。
+
+```sh
+uv run transcribe.py --device 0 --no-correction
+```
 
 処理中は開始から終了までの全音声を `recordings/YYYYMMDD-HHMMSS.wav` へ保存します。この蓄積WAVを30秒ごとにElevenLabs Scribe v2へ送り、精度重視の結果で `transcripts/YYYYMMDD-HHMMSS-final.md` を書き直します。停止時にも全WAVで最終更新し、保存に成功するとWAVは自動で削除されます。API通信や保存に失敗した場合は、直前のfinalと再試行用WAVが残ります。
 
@@ -58,13 +64,13 @@ uv run transcribe.py --device 0
 uv run transcribe.py --device 0 --translate-ja
 ```
 
-確定した発話からOpenAIで話題ごとの図解カードを生成する場合は、`--cards` を追加します。録音中はRealtimeの確定結果から速報カードがローカルビューアへ追加されます。停止後はScribe v2のfinal transcript全文を見て意味単位を分割し直した品質版へ自動で切り替わり、タブから速報版にも戻れます。速報版は `cards_output/YYYYMMDD-HHMMSS.json`、品質版は `cards_output/YYYYMMDD-HHMMSS-final.json` に分けて保存し、同名のHTMLには両方を収録します。品質版の生成に失敗した場合は速報版が残ります。
+確定した発話からOpenAIで話題ごとの図解カードを生成する場合は、`--cards` を追加します。録音中は補正済みのRealtime確定結果から速報カードがローカルビューアへ追加されます。停止後はScribe v2のfinal transcript全文を見て意味単位を分割し直した品質版へ自動で切り替わり、タブから速報版にも戻れます。速報版は `cards_output/YYYYMMDD-HHMMSS.json`、品質版は `cards_output/YYYYMMDD-HHMMSS-final.json` に分けて保存し、同名のHTMLには両方を収録します。品質版の生成に失敗した場合は速報版が残ります。
 
 ```sh
 uv run transcribe.py --device 0 --cards
 ```
 
-生成は既定で300文字、20秒間の新規発話なし、または前回生成から90秒のいずれかで始まります。必要なら `--cards-character-threshold`、`--cards-idle-seconds`、`--cards-max-seconds` で調整し、ビューアのポート競合時は `--cards-port` を変更できます。`--translate-ja` と同時指定した場合も、図解には翻訳前の原文を使います。
+生成は既定で300文字、20秒間の新規発話なし、または前回生成から90秒のいずれかで始まります。必要なら `--cards-character-threshold`、`--cards-idle-seconds`、`--cards-max-seconds` で調整し、ビューアのポート競合時は `--cards-port` を変更できます。`--translate-ja` と同時指定した場合も、図解には補正済み・翻訳前のテキストを使います。
 
 音声は無音を含め、16kHz PCMを100ms単位で常時送信します。発話の確定はElevenLabs側のVADに任せ、800msの無音で区切ります。終了時は100ms未満の残りも送信して確定します。
 
