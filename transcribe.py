@@ -23,11 +23,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import wave
-from array import array
 from collections import deque
 from collections.abc import Awaitable, Callable
 from datetime import datetime
-from math import isqrt
 from pathlib import Path
 from typing import Any
 
@@ -51,11 +49,6 @@ CHUNK_MILLISECONDS = 10
 CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MILLISECONDS // 1_000
 UPLOAD_CHUNK_MILLISECONDS = 100
 UPLOAD_CHUNK_BYTES = SAMPLE_RATE * 2 * UPLOAD_CHUNK_MILLISECONDS // 1_000
-KEEPALIVE_INTERVAL_MILLISECONDS = 5_000
-SILENCE_RMS_THRESHOLD = 500
-PRE_ROLL_MILLISECONDS = 500
-SILENCE_COMMIT_MILLISECONDS = 800
-MAX_TURN_MILLISECONDS = 30_000
 FINAL_WAIT_SECONDS = 5
 TRANSLATION_TIMEOUT_SECONDS = 20
 ENV_FILE = Path(".env.local")
@@ -79,62 +72,6 @@ class BatchTranscriptionError(TranscriptionError):
 
 class TranslationError(TranscriptionError):
     """OpenAI couldn't translate a completed transcript."""
-
-
-def pcm16_rms(chunk: bytes) -> int:
-    samples = array("h")
-    samples.frombytes(chunk)
-    if sys.byteorder != "little":
-        samples.byteswap()
-    return isqrt(sum(sample * sample for sample in samples) // len(samples))
-
-
-class LocalTurnDetector:
-    """Gate uploads until speech, retaining a short local pre-roll."""
-
-    def __init__(self, silence_rms_threshold: int = SILENCE_RMS_THRESHOLD) -> None:
-        self.silence_rms_threshold = silence_rms_threshold
-        self.buffered_milliseconds = 0
-        self.silent_milliseconds = 0
-        self.heard_speech = False
-        self.commits_sent = 0
-        self.pre_roll: deque[bytes] = deque(
-            maxlen=PRE_ROLL_MILLISECONDS // CHUNK_MILLISECONDS
-        )
-
-    def observe(self, chunk: bytes) -> tuple[list[bytes], bool]:
-        is_speech = pcm16_rms(chunk) >= self.silence_rms_threshold
-        if not self.heard_speech:
-            self.pre_roll.append(chunk)
-            if not is_speech:
-                return [], False
-            self.heard_speech = True
-            chunks = list(self.pre_roll)
-            self.pre_roll.clear()
-            self.buffered_milliseconds = len(chunks) * CHUNK_MILLISECONDS
-            self.silent_milliseconds = 0
-        else:
-            chunks = [chunk]
-            self.buffered_milliseconds += CHUNK_MILLISECONDS
-            if is_speech:
-                self.silent_milliseconds = 0
-            else:
-                self.silent_milliseconds += CHUNK_MILLISECONDS
-
-        should_commit = self.buffered_milliseconds >= MAX_TURN_MILLISECONDS or (
-            self.silent_milliseconds >= SILENCE_COMMIT_MILLISECONDS
-        )
-        return chunks, should_commit
-
-    def mark_committed(self) -> None:
-        self.commits_sent += 1
-        self.buffered_milliseconds = 0
-        self.silent_milliseconds = 0
-        self.heard_speech = False
-        self.pre_roll.clear()
-
-    def has_buffered_audio(self) -> bool:
-        return self.heard_speech and self.buffered_milliseconds > 0
 
 
 class TranscriptReducer:
@@ -179,13 +116,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mode.add_argument(
         "--device", type=non_negative_integer, metavar="INDEX", help="音声入力番号"
-    )
-    parser.add_argument(
-        "--silence-threshold",
-        type=non_negative_integer,
-        default=SILENCE_RMS_THRESHOLD,
-        metavar="RMS",
-        help=f"無音判定のRMS値（既定: {SILENCE_RMS_THRESHOLD}）",
     )
     parser.add_argument(
         "--translate-ja",
@@ -343,7 +273,8 @@ def realtime_url() -> str:
         {
             "model_id": MODEL,
             "audio_format": "pcm_16000",
-            "commit_strategy": "manual",
+            "commit_strategy": "vad",
+            "vad_silence_threshold_secs": 0.8,
             "language_code": "ja",
             "secondary_languages": ["en", "ko"],
         },
@@ -530,40 +461,23 @@ async def stream_audio(
     websocket: Any,
     process: asyncio.subprocess.Process,
     stop_event: asyncio.Event,
-    turn_detector: LocalTurnDetector,
     record_audio: Callable[[bytes], None],
-) -> None:
+) -> bool:
     assert process.stdout is not None
     upload_buffer = bytearray()
-    idle_milliseconds = 0
+    has_audio = False
 
-    async def send_audio(audio: bytes) -> None:
+    async def send_audio(audio: bytes, commit: bool = False) -> None:
         await websocket.send(
             json.dumps(
                 {
                     "message_type": "input_audio_chunk",
                     "audio_base_64": base64.b64encode(audio).decode("ascii"),
-                    "commit": False,
+                    "commit": commit,
                     "sample_rate": SAMPLE_RATE,
                 }
             )
         )
-
-    async def commit() -> None:
-        if upload_buffer:
-            await send_audio(bytes(upload_buffer))
-            upload_buffer.clear()
-        await websocket.send(
-            json.dumps(
-                {
-                    "message_type": "input_audio_chunk",
-                    "audio_base_64": "",
-                    "commit": True,
-                    "sample_rate": SAMPLE_RATE,
-                }
-            )
-        )
-        turn_detector.mark_committed()
 
     while not stop_event.is_set():
         try:
@@ -577,26 +491,16 @@ async def stream_audio(
             detail = stderr.decode(errors="replace").strip()
             raise CaptureError(detail or "音声入力が終了しました。")
         record_audio(chunk)
-        if stop_event.is_set():
-            break
-        chunks, should_commit = turn_detector.observe(chunk)
-        if chunks:
-            idle_milliseconds = 0
-        else:
-            idle_milliseconds += CHUNK_MILLISECONDS
-            if idle_milliseconds >= KEEPALIVE_INTERVAL_MILLISECONDS:
-                await send_audio(bytes(UPLOAD_CHUNK_BYTES))
-                idle_milliseconds = 0
-        for upload_chunk in chunks:
-            upload_buffer.extend(upload_chunk)
-            while len(upload_buffer) >= UPLOAD_CHUNK_BYTES:
-                await send_audio(bytes(upload_buffer[:UPLOAD_CHUNK_BYTES]))
-                del upload_buffer[:UPLOAD_CHUNK_BYTES]
-        if should_commit:
-            await commit()
+        has_audio = True
+        upload_buffer.extend(chunk)
+        while len(upload_buffer) >= UPLOAD_CHUNK_BYTES:
+            await send_audio(bytes(upload_buffer[:UPLOAD_CHUNK_BYTES]))
+            del upload_buffer[:UPLOAD_CHUNK_BYTES]
 
-    if turn_detector.has_buffered_audio():
-        await commit()
+    if not has_audio:
+        return False
+    await send_audio(bytes(upload_buffer), commit=True)
+    return True
 
 
 async def receive_events(
@@ -676,7 +580,6 @@ async def run_transcription(
     elevenlabs_api_key: str,
     openai_api_key: str,
     ffmpeg: str,
-    silence_rms_threshold: int = SILENCE_RMS_THRESHOLD,
     translate_to_ja: bool = False,
     cards_enabled: bool = False,
     cards_port: int = 8765,
@@ -691,7 +594,6 @@ async def run_transcription(
 
     stop_event = asyncio.Event()
     progress_changed = asyncio.Event()
-    turn_detector = LocalTurnDetector(silence_rms_threshold)
     loop = asyncio.get_running_loop()
     loop.add_signal_handler(signal.SIGINT, stop_event.set)
     process: asyncio.subprocess.Process | None = None
@@ -792,7 +694,6 @@ async def run_transcription(
                         websocket,
                         process,
                         stop_event,
-                        turn_detector,
                         recording.writeframesraw,
                     )
                 )
@@ -809,20 +710,21 @@ async def run_transcription(
 
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 if stopper in done:
+                    expected_commits = reducer.commits_received + 1
                     stop_event.set()
                     await stop_process(process)
-                    await asyncio.gather(sender, return_exceptions=True)
-                    try:
-                        await asyncio.wait_for(
-                            wait_for_committed_transcripts(
-                                reducer,
-                                progress_changed,
-                                turn_detector.commits_sent,
-                            ),
-                            timeout=FINAL_WAIT_SECONDS,
-                        )
-                    except TimeoutError:
-                        pass
+                    if await sender:
+                        try:
+                            await asyncio.wait_for(
+                                wait_for_committed_transcripts(
+                                    reducer,
+                                    progress_changed,
+                                    expected_commits,
+                                ),
+                                timeout=FINAL_WAIT_SECONDS,
+                            )
+                        except TimeoutError:
+                            pass
                     if receiver.done():
                         receiver.result()
                 elif sender in done:
@@ -912,7 +814,6 @@ def main(argv: list[str] | None = None) -> int:
                 elevenlabs_api_key,
                 openai_api_key,
                 ffmpeg,
-                silence_rms_threshold=args.silence_threshold,
                 translate_to_ja=args.translate_ja,
                 cards_enabled=args.cards,
                 cards_port=args.cards_port,

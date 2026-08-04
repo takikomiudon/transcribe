@@ -27,7 +27,8 @@ def test_model_configuration() -> None:
     assert parse_qs(parsed.query) == {
         "model_id": ["scribe_v2_realtime"],
         "audio_format": ["pcm_16000"],
-        "commit_strategy": ["manual"],
+        "commit_strategy": ["vad"],
+        "vad_silence_threshold_secs": ["0.8"],
         "language_code": ["ja"],
         "secondary_languages": ["en", "ko"],
     }
@@ -194,6 +195,7 @@ def test_translation_flag() -> None:
         ["--device", "0", "--translate-ja"]
     )
     assert args.translate_ja
+    assert "silence_threshold" not in vars(args)
 
 
 def test_cards_flags() -> None:
@@ -250,73 +252,23 @@ def test_api_key_auto_load() -> None:
         read_text.assert_not_called()
 
 
-def test_local_turn_detection() -> None:
-    loud = (transcribe.SILENCE_RMS_THRESHOLD + 1).to_bytes(
-        2, "little", signed=True
-    ) * (transcribe.CHUNK_BYTES // 2)
-    silence = bytes(transcribe.CHUNK_BYTES)
-    detector = transcribe.LocalTurnDetector()
+async def test_all_audio_is_streamed_in_batches_and_committed_on_stop() -> None:
+    stop_event = asyncio.Event()
 
-    pre_roll_chunks = (
-        transcribe.PRE_ROLL_MILLISECONDS // transcribe.CHUNK_MILLISECONDS
-    )
-    for _ in range(pre_roll_chunks + 10):
-        assert detector.observe(silence) == ([], False)
-    assert not detector.has_buffered_audio()
-
-    chunks, should_commit = detector.observe(loud)
-    assert len(chunks) == pre_roll_chunks
-    assert chunks[-1] == loud
-    assert not should_commit
-    silence_chunks = (
-        transcribe.SILENCE_COMMIT_MILLISECONDS // transcribe.CHUNK_MILLISECONDS
-    )
-    for _ in range(silence_chunks - 1):
-        assert detector.observe(silence) == ([silence], False)
-    assert detector.observe(silence) == ([silence], True)
-
-    detector.mark_committed()
-    assert detector.commits_sent == 1
-    assert not detector.has_buffered_audio()
-
-    max_chunks = transcribe.MAX_TURN_MILLISECONDS // transcribe.CHUNK_MILLISECONDS
-    assert detector.observe(loud) == ([loud], False)
-    for _ in range(max_chunks - 2):
-        assert detector.observe(loud) == ([loud], False)
-    assert detector.observe(loud) == ([loud], True)
-
-
-def test_eight_hundred_millisecond_pause_splits_a_turn() -> None:
-    loud = (transcribe.SILENCE_RMS_THRESHOLD + 1).to_bytes(
-        2, "little", signed=True
-    ) * (transcribe.CHUNK_BYTES // 2)
-    silence = bytes(transcribe.CHUNK_BYTES)
-    detector = transcribe.LocalTurnDetector()
-
-    assert detector.observe(loud) == ([loud], False)
-    for _ in range(800 // transcribe.CHUNK_MILLISECONDS - 1):
-        assert detector.observe(silence) == ([silence], False)
-    assert detector.observe(silence) == ([silence], True)
-
-
-async def test_idle_silence_is_not_uploaded() -> None:
     class SilenceStdout:
         def __init__(self) -> None:
-            self.remaining = 100
+            self.remaining = 11
 
         async def readexactly(self, expected: int) -> bytes:
             if self.remaining:
                 self.remaining -= 1
                 return bytes(expected)
+            stop_event.set()
             raise asyncio.IncompleteReadError(partial=b"", expected=expected)
-
-    class ErrorReader:
-        async def read(self, _: int = -1) -> bytes:
-            return b"capture ended"
 
     class FakeProcess:
         stdout = SilenceStdout()
-        stderr = ErrorReader()
+        stderr = None
 
     class FakeWebSocket:
         def __init__(self) -> None:
@@ -327,195 +279,24 @@ async def test_idle_silence_is_not_uploaded() -> None:
 
     websocket = FakeWebSocket()
     recorded = bytearray()
-    try:
-        await transcribe.stream_audio(
-            websocket,
-            FakeProcess(),  # type: ignore[arg-type]
-            asyncio.Event(),
-            transcribe.LocalTurnDetector(),
-            recorded.extend,
-        )
-    except transcribe.CaptureError:
-        pass
-    else:
-        raise AssertionError("CaptureError was not raised")
-    assert websocket.messages == []
-    assert recorded == bytes(transcribe.CHUNK_BYTES * 100)
-
-
-async def test_long_idle_sends_minimal_keepalive() -> None:
-    class IdleStdout:
-        def __init__(self) -> None:
-            self.remaining = (
-                transcribe.KEEPALIVE_INTERVAL_MILLISECONDS
-                // transcribe.CHUNK_MILLISECONDS
-            )
-
-        async def readexactly(self, expected: int) -> bytes:
-            if self.remaining:
-                self.remaining -= 1
-                return bytes(expected)
-            raise asyncio.IncompleteReadError(partial=b"", expected=expected)
-
-    class ErrorReader:
-        async def read(self, _: int = -1) -> bytes:
-            return b"capture ended"
-
-    class FakeProcess:
-        stdout = IdleStdout()
-        stderr = ErrorReader()
-
-    class FakeWebSocket:
-        def __init__(self) -> None:
-            self.messages: list[str] = []
-
-        async def send(self, message: str) -> None:
-            self.messages.append(message)
-
-    websocket = FakeWebSocket()
-    try:
-        await transcribe.stream_audio(
-            websocket,
-            FakeProcess(),  # type: ignore[arg-type]
-            asyncio.Event(),
-            transcribe.LocalTurnDetector(),
-            lambda _: None,
-        )
-    except transcribe.CaptureError:
-        pass
-    else:
-        raise AssertionError("CaptureError was not raised")
-
-    assert len(websocket.messages) == 1
-    message = json.loads(websocket.messages[0])
-    assert message["commit"] is False
-    assert base64.b64decode(message["audio_base_64"]) == bytes(
-        transcribe.UPLOAD_CHUNK_BYTES
-    )
-
-
-async def test_audio_chunks_are_batched_and_committed() -> None:
-    class OneChunkStdout:
-        def __init__(self) -> None:
-            self.sent = False
-
-        async def readexactly(self, expected: int) -> bytes:
-            if not self.sent:
-                self.sent = True
-                return bytes(expected)
-            raise asyncio.IncompleteReadError(partial=b"", expected=expected)
-
-    class ErrorReader:
-        async def read(self, _: int = -1) -> bytes:
-            return b"capture ended"
-
-    class FakeProcess:
-        stdout = OneChunkStdout()
-        stderr = ErrorReader()
-
-    class FakeWebSocket:
-        def __init__(self) -> None:
-            self.messages: list[str] = []
-
-        async def send(self, message: str) -> None:
-            self.messages.append(message)
-
-    class FakeDetector:
-        commits_sent = 0
-
-        def observe(self, _: bytes) -> tuple[list[bytes], bool]:
-            return [b"x" * transcribe.CHUNK_BYTES] * 11, True
-
-        def mark_committed(self) -> None:
-            self.commits_sent += 1
-
-        def has_buffered_audio(self) -> bool:
-            return False
-
-    websocket = FakeWebSocket()
-    try:
-        await transcribe.stream_audio(
-            websocket,
-            FakeProcess(),  # type: ignore[arg-type]
-            asyncio.Event(),
-            FakeDetector(),  # type: ignore[arg-type]
-            lambda _: None,
-        )
-    except transcribe.CaptureError:
-        pass
-    else:
-        raise AssertionError("CaptureError was not raised")
-
-    messages = [json.loads(message) for message in websocket.messages]
-    assert [message["message_type"] for message in messages] == [
-        "input_audio_chunk",
-        "input_audio_chunk",
-        "input_audio_chunk",
-    ]
-    assert len(base64.b64decode(messages[0]["audio_base_64"])) == (
-        transcribe.UPLOAD_CHUNK_BYTES
-    )
-    assert len(base64.b64decode(messages[1]["audio_base_64"])) == (
-        transcribe.CHUNK_BYTES
-    )
-    assert messages[0]["sample_rate"] == transcribe.SAMPLE_RATE
-    assert messages[0]["commit"] is False
-    assert messages[2] == {
-        "message_type": "input_audio_chunk",
-        "audio_base_64": "",
-        "commit": True,
-        "sample_rate": transcribe.SAMPLE_RATE,
-    }
-
-
-async def test_stop_commits_buffered_audio() -> None:
-    stop_event = asyncio.Event()
-
-    class StoppedStdout:
-        async def readexactly(self, expected: int) -> bytes:
-            stop_event.set()
-            raise asyncio.IncompleteReadError(partial=b"", expected=expected)
-
-    class FakeProcess:
-        stdout = StoppedStdout()
-        stderr = None
-
-    class FakeWebSocket:
-        def __init__(self) -> None:
-            self.messages: list[str] = []
-
-        async def send(self, message: str) -> None:
-            self.messages.append(message)
-
-    class FakeDetector:
-        commits_sent = 0
-
-        def observe(self, _: bytes) -> tuple[list[bytes], bool]:
-            raise AssertionError("audio should not be observed")
-
-        def mark_committed(self) -> None:
-            self.commits_sent += 1
-
-        def has_buffered_audio(self) -> bool:
-            return True
-
-    websocket = FakeWebSocket()
-    detector = FakeDetector()
-    await transcribe.stream_audio(
+    committed = await transcribe.stream_audio(
         websocket,
         FakeProcess(),  # type: ignore[arg-type]
         stop_event,
-        detector,  # type: ignore[arg-type]
-        lambda _: None,
+        recorded.extend,
     )
-
-    assert detector.commits_sent == 1
-    assert json.loads(websocket.messages[-1]) == {
-        "message_type": "input_audio_chunk",
-        "audio_base_64": "",
-        "commit": True,
-        "sample_rate": transcribe.SAMPLE_RATE,
-    }
+    messages = [json.loads(message) for message in websocket.messages]
+    assert committed
+    assert len(messages) == 2
+    assert messages[0]["commit"] is False
+    assert base64.b64decode(messages[0]["audio_base_64"]) == bytes(
+        transcribe.UPLOAD_CHUNK_BYTES
+    )
+    assert messages[1]["commit"] is True
+    assert base64.b64decode(messages[1]["audio_base_64"]) == bytes(
+        transcribe.CHUNK_BYTES
+    )
+    assert recorded == bytes(transcribe.CHUNK_BYTES * 11)
 
 
 def test_realtime_events_and_repeated_transcripts() -> None:
@@ -659,7 +440,6 @@ async def test_capture_eof_and_process_cleanup() -> None:
             FakeWebSocket(),
             FakeProcess(),  # type: ignore[arg-type]
             asyncio.Event(),
-            transcribe.LocalTurnDetector(),
             lambda _: None,
         )
     except transcribe.CaptureError as error:
@@ -845,13 +625,13 @@ async def test_cards_receive_original_text_and_close_with_translation() -> None:
         _: object,
         __: object,
         stop_event: asyncio.Event,
-        ___: object,
         record_audio: object,
-    ) -> None:
+    ) -> bool:
         assert callable(record_audio)
         record_audio(bytes(transcribe.CHUNK_BYTES))
         await finalized.wait()
         stop_event.set()
+        return False
 
     async def fake_receive(
         _: object,
@@ -951,12 +731,7 @@ def main() -> None:
     test_translation_flag()
     test_cards_flags()
     test_api_key_auto_load()
-    test_local_turn_detection()
-    test_eight_hundred_millisecond_pause_splits_a_turn()
-    asyncio.run(test_idle_silence_is_not_uploaded())
-    asyncio.run(test_long_idle_sends_minimal_keepalive())
-    asyncio.run(test_audio_chunks_are_batched_and_committed())
-    asyncio.run(test_stop_commits_buffered_audio())
+    asyncio.run(test_all_audio_is_streamed_in_batches_and_committed_on_stop())
     test_realtime_events_and_repeated_transcripts()
     test_missing_key_stops_before_capture()
     test_batch_failure_returns_error_and_reports_preserved_recording()
