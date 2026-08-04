@@ -379,6 +379,50 @@ def correct_transcript(
         return text
 
 
+def glossary_payload(text: str) -> dict[str, Any]:
+    return {
+        "model": TRANSLATION_MODEL,
+        "reasoning": {"effort": "none"},
+        "instructions": (
+            "ASR文字起こしから、補正に役立つ固有名詞と専門用語を最大30個抽出してください。"
+            "一般語、文章、説明は含めず、文字起こしに実際に現れる表記を保持してください。"
+        ),
+        "input": text[-4_000:],
+        "max_output_tokens": 1_024,
+        "store": False,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "transcript_glossary",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "terms": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        }
+                    },
+                    "required": ["terms"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+    }
+
+
+def extract_glossary(text: str, api_key: str) -> list[str]:
+    value = json.loads(
+        request_response_text(
+            glossary_payload(text), api_key, CORRECTION_TIMEOUT_SECONDS
+        )
+    )
+    terms = value.get("terms") if isinstance(value, dict) else None
+    if not isinstance(terms, list) or not all(isinstance(term, str) for term in terms):
+        raise ValueError("用語集の応答形式が不正です。")
+    return list(dict.fromkeys(term.strip() for term in terms if term.strip()))[:30]
+
+
 def batch_transcribe(audio_path: Path, api_key: str, curl: str) -> str:
     try:
         result = subprocess.run(
@@ -486,6 +530,8 @@ async def periodically_refresh_final(
     curl: str,
     stop_event: asyncio.Event,
     interval_seconds: float = BATCH_REFRESH_SECONDS,
+    glossary: list[str] | None = None,
+    openai_api_key: str = "",
 ) -> None:
     loop = asyncio.get_running_loop()
     next_refresh = loop.time() + interval_seconds
@@ -504,6 +550,19 @@ async def periodically_refresh_final(
             text = await asyncio.to_thread(batch_transcribe, snapshot, api_key, curl)
             output_path = write_batch_transcript(realtime_path, text)
             print(f"final更新: {output_path}", flush=True)
+            if glossary is not None:
+                try:
+                    updated = await asyncio.to_thread(
+                        extract_glossary, text, openai_api_key
+                    )
+                except Exception as error:
+                    print(
+                        f"[補正] 警告: 用語集を更新できません: {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    glossary[:] = updated
         except BatchTranscriptionError as error:
             print(f"[batch] 警告: {error}", file=sys.stderr, flush=True)
         finally:
@@ -690,6 +749,27 @@ async def wait_for_committed_transcripts(
         if reducer.commits_received >= expected_commits:
             break
         await progress_changed.wait()
+
+
+async def process_corrections(
+    queue: asyncio.Queue[str | None],
+    glossary: list[str],
+    api_key: str,
+    finalize_text: Callable[[str], Awaitable[None]],
+) -> None:
+    context = ""
+    while True:
+        text = await queue.get()
+        try:
+            if text is None:
+                return
+            corrected = await asyncio.to_thread(
+                correct_transcript, text, context, glossary.copy(), api_key
+            )
+            await finalize_text(corrected)
+            context = "\n".join(filter(None, (context, corrected)))[-500:]
+        finally:
+            queue.task_done()
 
 
 async def stop_process(process: asyncio.subprocess.Process | None) -> None:

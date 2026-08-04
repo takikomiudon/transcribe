@@ -287,6 +287,159 @@ async def test_periodic_batch_failure_keeps_previous_final() -> None:
     assert not snapshot.exists()
 
 
+async def test_periodic_batch_refresh_updates_correction_glossary() -> None:
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    temporary = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    temporary.close()
+    snapshot = Path(temporary.name)
+    transcript = "前" * 4_100 + "セブンイレブンとOpenAI"
+    glossary = ["古い用語"]
+
+    def transcribe_snapshot(*_: object) -> str:
+        loop.call_soon_threadsafe(stop_event.set)
+        return transcript
+
+    response = MagicMock()
+    response.__enter__.return_value.read.return_value = json.dumps(
+        {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": json.dumps(
+                                {
+                                    "terms": [
+                                        " セブンイレブン ",
+                                        "OpenAI",
+                                        "セブンイレブン",
+                                    ]
+                                }
+                            ),
+                        }
+                    ],
+                }
+            ]
+        }
+    ).encode()
+
+    with tempfile.TemporaryDirectory() as directory:
+        realtime_path = Path(directory) / "session.md"
+        with (
+            patch("transcribe.snapshot_recording", return_value=snapshot),
+            patch("transcribe.batch_transcribe", side_effect=transcribe_snapshot),
+            patch(
+                "transcribe.urllib.request.urlopen", return_value=response
+            ) as urlopen,
+        ):
+            await transcribe.periodically_refresh_final(
+                realtime_path,
+                Path("recording.wav"),
+                object(),
+                object(),
+                "eleven-key",
+                "/usr/bin/curl",
+                stop_event,
+                interval_seconds=0.01,
+                glossary=glossary,
+                openai_api_key="openai-key",
+            )
+
+    assert glossary == ["セブンイレブン", "OpenAI"]
+    request = urlopen.call_args.args[0]
+    payload = json.loads(request.data)
+    assert payload["input"] == transcript[-4_000:]
+
+    received_glossaries: list[list[str]] = []
+
+    def capture_glossary(
+        text: str, context: str, terms: list[str], api_key: str
+    ) -> str:
+        received_glossaries.append(terms)
+        return text
+
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    async def finalize_text(_: str) -> None:
+        return None
+
+    with patch("transcribe.correct_transcript", side_effect=capture_glossary):
+        worker = asyncio.create_task(
+            transcribe.process_corrections(
+                queue, glossary, "openai-key", finalize_text
+            )
+        )
+        queue.put_nowait("次の発話")
+        queue.put_nowait(None)
+        await queue.join()
+        await worker
+
+    assert received_glossaries == [["セブンイレブン", "OpenAI"]]
+
+
+async def test_correction_worker_preserves_original_and_order() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        output_path = Path(directory) / "session.md"
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        async def write_final(text: str) -> None:
+            with output_path.open("a", encoding="utf-8") as output:
+                output.write(text + "\n")
+
+        stderr = io.StringIO()
+        with (
+            patch(
+                "transcribe.urllib.request.urlopen",
+                side_effect=TimeoutError("slow"),
+            ),
+            redirect_stderr(stderr),
+        ):
+            worker = asyncio.create_task(
+                transcribe.process_corrections(
+                    queue, [], "openai-key", write_final
+                )
+            )
+            queue.put_nowait("失わない原文")
+            queue.put_nowait(None)
+            await queue.join()
+            await worker
+
+        assert output_path.read_text(encoding="utf-8") == "失わない原文\n"
+        assert "[補正] 警告:" in stderr.getvalue()
+
+    calls: list[tuple[str, str]] = []
+    written: list[str] = []
+
+    def correct_in_different_durations(
+        text: str, context: str, glossary: list[str], api_key: str
+    ) -> str:
+        calls.append((text, context))
+        time.sleep(0.02 if text == "first" else 0)
+        return f"{text}-corrected"
+
+    async def collect(text: str) -> None:
+        written.append(text)
+
+    queue = asyncio.Queue()
+    with patch(
+        "transcribe.correct_transcript", side_effect=correct_in_different_durations
+    ):
+        worker = asyncio.create_task(
+            transcribe.process_corrections(queue, [], "openai-key", collect)
+        )
+        for text in ("first", "second", "third"):
+            queue.put_nowait(text)
+        queue.put_nowait(None)
+        await queue.join()
+        await worker
+
+    assert written == ["first-corrected", "second-corrected", "third-corrected"]
+    assert calls[1][1] == "first-corrected"
+    assert len(calls[2][1]) <= 500
+
+
 def test_completed_batch_is_saved_before_recording_is_deleted() -> None:
     with tempfile.TemporaryDirectory() as directory:
         realtime_path = Path(directory) / "20260804-120000.md"
@@ -1051,6 +1204,8 @@ def main() -> None:
     test_recording_snapshot_is_a_complete_wav()
     asyncio.run(test_periodic_batch_refresh_retries_without_overlap())
     asyncio.run(test_periodic_batch_failure_keeps_previous_final())
+    asyncio.run(test_periodic_batch_refresh_updates_correction_glossary())
+    asyncio.run(test_correction_worker_preserves_original_and_order())
     test_completed_batch_is_saved_before_recording_is_deleted()
     test_batch_or_save_failure_preserves_recording()
     test_final_transcript_replaces_previous_checkpoint()
