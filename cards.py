@@ -652,7 +652,7 @@ class CardPipeline:
                     self.store.titles(),
                     self.model,
                 )
-            except Exception as error:
+            except (CardGenerationError, OSError, RuntimeError, ValueError) as error:
                 last_error = error
                 continue
             decision = str(result.get("decision", ""))

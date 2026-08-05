@@ -36,11 +36,13 @@ from cards import (
     CARD_IDLE_SECONDS,
     CARD_MAX_SECONDS,
     Card,
+    CardGenerationError,
     CardPipeline,
     generate_final_cards,
     save_cards,
 )
 from viewer import ViewerServer, export_cards, final_cards_path
+from websockets.exceptions import WebSocketException
 
 
 MODEL = "scribe_v2_realtime"
@@ -375,7 +377,13 @@ def correct_transcript(
             CORRECTION_TIMEOUT_SECONDS,
             model,
         )
-    except Exception as error:
+    except (
+        TranslationError,
+        urllib.error.URLError,
+        OSError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ) as error:
         print(f"[補正] 警告: {error}", file=sys.stderr, flush=True)
         return text
 
@@ -628,7 +636,13 @@ async def periodically_refresh_final(
                         updated = await asyncio.to_thread(
                             extract_glossary, text, openai_api_key, model
                         )
-                    except Exception as error:
+                    except (
+                        TranslationError,
+                        urllib.error.URLError,
+                        OSError,
+                        TimeoutError,
+                        ValueError,
+                    ) as error:
                         print(
                             f"[補正] 警告: 用語集を更新できません: {error}",
                             file=sys.stderr,
@@ -903,7 +917,7 @@ async def run_transcription(
                 max_seconds=cards_max_seconds,
             )
             pipeline.start()
-        except Exception as error:
+        except (OSError, RuntimeError) as error:
             print(f"[cards] 警告: 図解保存を開始できません: {error}", file=sys.stderr)
             pipeline = None
 
@@ -981,7 +995,7 @@ async def run_transcription(
                     if pipeline is not None:
                         try:
                             pipeline.add(text)
-                        except Exception as error:
+                        except (OSError, RuntimeError) as error:
                             print(
                                 f"[cards] 警告: 原文を図解へ渡せません: {error}",
                                 file=sys.stderr,
@@ -1081,7 +1095,15 @@ async def run_transcription(
         raise
     except OSError as error:
         raise TranscriptionError(f"接続または音声入力に失敗しました: {error}") from error
-    except Exception as error:
+    except (
+        WebSocketException,
+        OSError,
+        RuntimeError,
+        ValueError,
+        EOFError,
+        wave.Error,
+        TimeoutError,
+    ) as error:
         raise TranscriptionError(
             f"ElevenLabs Realtime APIとの通信に失敗しました: {error}"
         ) from error
@@ -1100,7 +1122,14 @@ async def run_transcription(
                 generated_cards = await pipeline.close()
                 export_path = export_cards(generated_cards, pipeline.html_path)
                 print(f"図解HTML: {export_path}")
-            except Exception as error:
+            except (
+                CardGenerationError,
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+            ) as error:
                 print(
                     f"[cards] 警告: 図解の終了処理に失敗しました: {error}",
                     file=sys.stderr,
@@ -1205,7 +1234,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"final図解HTML: {cards_html_path}")
                 if viewer_server is not None:
                     viewer_server.wait_for_final_cards()
-            except Exception as error:
+            except (
+                CardGenerationError,
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+            ) as error:
                 print(
                     f"[cards] 警告: final図解を生成できませんでした。"
                     f"速報版を保持します: {error}",

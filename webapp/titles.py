@@ -40,6 +40,6 @@ def generate_title(
         title = transcribe.request_response_text(
             title_payload(text, model), api_key, TITLE_TIMEOUT_SECONDS, model
         ).strip()
-    except Exception:
+    except (transcribe.TranslationError, OSError, TimeoutError, ValueError):
         return None
     return title[:20] or None

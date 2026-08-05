@@ -7,8 +7,11 @@ from collections.abc import Callable
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from websockets.exceptions import WebSocketException
 
 import ai
+import cards
+import transcribe
 from webapp.runner import (
     RunnerBusyError,
     SessionNotResumableError,
@@ -58,7 +61,7 @@ class WebSocketHub:
         for websocket in list(self.connections.get(id, ())):
             try:
                 await websocket.send_json(event)
-            except Exception:
+            except (OSError, RuntimeError, WebSocketDisconnect):
                 disconnected.append(websocket)
         for websocket in disconnected:
             await self.disconnect(id, websocket)
@@ -170,7 +173,14 @@ async def _start(websocket: WebSocket, id: str, command: dict[str, Any]) -> None
     except (RunnerBusyError, SessionNotResumableError, ValueError) as error:
         hub.finish(id, websocket)
         await _send_error(websocket, str(error))
-    except Exception:
+    except (
+        WebSocketException,
+        OSError,
+        RuntimeError,
+        ValueError,
+        transcribe.TranscriptionError,
+        cards.CardGenerationError,
+    ):
         hub.finish(id, websocket)
 
 
