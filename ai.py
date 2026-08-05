@@ -56,7 +56,10 @@ def api_key_for(model: AIModel, openai_key: str, deepseek_key: str) -> str:
     else:
         raise ValueError("利用できないAIプロバイダです。")
     if not key:
-        provider = "DeepSeek" if model.provider == DEEPSEEK_PROVIDER else "OpenAI"
+        if model.provider == DEEPSEEK_PROVIDER:
+            provider = "DeepSeek"
+        else:
+            provider = "OpenAI"
         raise ValueError(f"{provider} APIキーが設定されていません。")
     return key
 
