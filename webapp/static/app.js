@@ -2,6 +2,7 @@
 
 const state = {
   sessions: [],
+  models: [],
   currentId: null,
   status: {active_session_id: null, state: "idle"},
   ws: null,
@@ -19,6 +20,7 @@ const elements = {
   sessionTitleButton: document.getElementById("session-title-button"),
   sessionTitleInput: document.getElementById("session-title-input"),
   sessionMeta: document.getElementById("session-meta"),
+  modelSelect: document.getElementById("model-select"),
   statusBadge: document.getElementById("status-badge"),
   recordButton: document.getElementById("record-button"),
   toast: document.getElementById("toast"),
@@ -156,12 +158,14 @@ async function request(path, options = {}) {
 async function initialize() {
   bindControls();
   try {
-    const [sessionsPayload, statusPayload] = await Promise.all([
+    const [sessionsPayload, statusPayload, configPayload] = await Promise.all([
       request("/api/sessions"),
       request("/api/status"),
+      request("/api/config"),
     ]);
     state.sessions = sortSessions(sessionsPayload.sessions);
     state.status = statusPayload;
+    state.models = configPayload.models;
     renderSidebar();
     if (state.sessions.length) await selectSession(state.sessions[0].id);
     else await createSession();
@@ -173,6 +177,7 @@ async function initialize() {
 function bindControls() {
   elements.newSession.addEventListener("click", createSession);
   elements.recordButton.addEventListener("click", handleRecordButton);
+  elements.modelSelect.addEventListener("change", changeModel);
   elements.sessionTitleButton.addEventListener("click", beginHeaderRename);
   elements.sessionTitleInput.addEventListener("blur", finishHeaderRename);
   elements.sessionTitleInput.addEventListener("keydown", event => {
@@ -629,6 +634,24 @@ async function renameSession(id, title) {
   return session;
 }
 
+async function changeModel() {
+  const session = currentDetail?.session;
+  const model = state.models.find(item => modelKey(item) === elements.modelSelect.value);
+  if (!session || session.has_audio || !model) return;
+  try {
+    const updated = await request(`/api/sessions/${encodeURIComponent(session.id)}/model`, {
+      method: "PATCH",
+      body: JSON.stringify({provider: model.provider, model: model.model}),
+    });
+    currentDetail.session = updated;
+    upsertSession(updated);
+    renderHeader();
+  } catch (error) {
+    showToast(error.message);
+    renderHeader();
+  }
+}
+
 async function deleteSession(session) {
   closeSessionMenus();
   const title = session.title || stemTitle(session.id);
@@ -694,6 +717,7 @@ function renderHeader() {
     elements.sessionMeta.textContent = "履歴からセッションを選んでください。";
     elements.recordButton.disabled = true;
     elements.recordButton.dataset.action = "";
+    renderModelSelector(null, false, false);
     return;
   }
 
@@ -704,6 +728,7 @@ function renderHeader() {
   const activeHere = activeId === session.id;
   const finalizing = activeHere && ["stopping", "finalizing"].includes(state.status.state);
   const recording = activeHere && state.status.state === "recording";
+  renderModelSelector(session, recording, finalizing);
 
   elements.statusBadge.className = "status-badge stopped";
   elements.statusBadge.textContent = "停止";
@@ -744,6 +769,29 @@ function renderHeader() {
     button.title = "録音ファイルが削除済みのため再開できません";
   }
   elements.levelRow.hidden = !recording;
+}
+
+function modelKey(model) {
+  return `${model.provider}:${model.model}`;
+}
+
+function renderModelSelector(session, recording, finalizing) {
+  const select = elements.modelSelect;
+  if (select.options.length !== state.models.length) {
+    select.replaceChildren(...state.models.map(model => {
+      const option = document.createElement("option");
+      option.value = modelKey(model);
+      option.textContent = model.label;
+      return option;
+    }));
+  }
+  if (!session || !state.models.length) {
+    select.disabled = true;
+    return;
+  }
+  const value = modelKey(session);
+  if ([...select.options].some(option => option.value === value)) select.value = value;
+  select.disabled = session.has_audio || recording || finalizing || startRequested;
 }
 
 function renderAudio() {

@@ -92,6 +92,13 @@ def test_config_lists_only_configured_models() -> None:
         ]
 
 
+def test_index_includes_accessible_model_selector() -> None:
+    with api_client() as (client, _):
+        html = client.get("/").text
+        assert 'id="model-select"' in html
+        assert 'for="model-select"' in html
+
+
 def test_model_can_be_selected_before_recording_only() -> None:
     with api_client("deepseek-key") as (client, _):
         session = client.post("/api/sessions").json()
