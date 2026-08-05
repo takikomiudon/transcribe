@@ -56,6 +56,13 @@ let recordingInterrupted = false;
 const cardVersions = new Map();
 const cardTabs = [elements.liveCardsTab, elements.finalCardsTab];
 
+function requireError(error) {
+  if (!(error instanceof Error)) {
+    throw new TypeError("Error以外の例外は処理できません。");
+  }
+  return error;
+}
+
 class Recorder {
   constructor() {
     this.stream = null;
@@ -80,7 +87,8 @@ class Recorder {
       if (!AudioContextClass) throw new Error("このブラウザは音声録音に対応していません。");
       try {
         this.context = new AudioContextClass({sampleRate: 16000});
-      } catch (_error) {
+      } catch (error) {
+        if (!(error instanceof TypeError || error instanceof DOMException)) throw error;
         this.context = new AudioContextClass();
       }
       await this.context.audioWorklet.addModule("/static/recorder-worklet.js");
@@ -109,8 +117,9 @@ class Recorder {
       this.node.connect(this.sink).connect(this.context.destination);
       if (this.context.state === "suspended") await this.context.resume();
     } catch (error) {
+      const recorderError = requireError(error);
       await this.stop();
-      throw error;
+      throw recorderError;
     }
   }
 
@@ -146,7 +155,8 @@ async function request(path, options = {}) {
     try {
       const payload = await response.json();
       if (payload.detail) message = payload.detail;
-    } catch (_error) {
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
       // HTTP status is enough when the response isn't JSON.
     }
     throw new Error(message);
@@ -170,7 +180,7 @@ async function initialize() {
     if (state.sessions.length) await selectSession(state.sessions[0].id);
     else await createSession();
   } catch (error) {
-    showToast(error.message);
+    showToast(requireError(error).message);
   }
 }
 
@@ -231,7 +241,7 @@ async function createSession() {
     upsertSession(session);
     await selectSession(session.id);
   } catch (error) {
-    showToast(error.message);
+    showToast(requireError(error).message);
   } finally {
     elements.newSession.disabled = false;
   }
@@ -260,7 +270,7 @@ async function selectSession(id) {
     applySessionDetail(detail);
     openSocket(id);
   } catch (error) {
-    if (version === selectionVersion) showToast(error.message);
+    if (version === selectionVersion) showToast(requireError(error).message);
   }
 }
 
@@ -279,14 +289,15 @@ function openSocket(id, reconnecting = false) {
       await resyncCurrentSession(id);
       if (!interrupted) showToast("サーバーへ再接続しました。");
     } catch (error) {
-      showToast(error.message);
+      showToast(requireError(error).message);
     }
   });
   socket.addEventListener("message", async event => {
     if (state.ws !== socket) return;
     try {
       await handleServerEvent(JSON.parse(event.data));
-    } catch (_error) {
+    } catch (error) {
+      if (!(error instanceof SyntaxError || error instanceof TypeError)) throw error;
       showToast("サーバーから不正なメッセージを受信しました。");
     }
   });
@@ -448,7 +459,8 @@ async function startLocalRecorder() {
     await recorder.start();
     startRequested = false;
     renderHeader();
-  } catch (_error) {
+  } catch (error) {
+    requireError(error);
     state.recorder = null;
     startRequested = false;
     showToast("マイクを利用できません。ブラウザのマイク権限を確認してください。");
@@ -602,7 +614,7 @@ function beginSidebarRename(session, item) {
         await renameSession(session.id, title);
         return;
       } catch (error) {
-        showToast(error.message);
+        showToast(requireError(error).message);
       }
     } else if (save) {
       showToast("タイトルを入力してください。");
@@ -647,7 +659,7 @@ async function changeModel() {
     upsertSession(updated);
     renderHeader();
   } catch (error) {
-    showToast(error.message);
+    showToast(requireError(error).message);
     renderHeader();
   }
 }
@@ -671,7 +683,7 @@ async function deleteSession(session) {
     if (state.sessions.length) await selectSession(state.sessions[0].id);
     else await createSession();
   } catch (error) {
-    showToast(error.message);
+    showToast(requireError(error).message);
   }
 }
 
@@ -699,7 +711,7 @@ async function finishHeaderRename() {
   try {
     await renameSession(id, title);
   } catch (error) {
-    showToast(error.message);
+    showToast(requireError(error).message);
   }
 }
 
