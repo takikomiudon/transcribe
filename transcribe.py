@@ -48,7 +48,6 @@ BATCH_MODEL = "scribe_v2"
 TRANSLATION_MODEL = ai.DEFAULT_AI_MODEL.model
 WEBSOCKET_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
 BATCH_TRANSCRIPTION_URL = "https://api.elevenlabs.io/v1/speech-to-text"
-RESPONSES_URL = "https://api.openai.com/v1/responses"
 SAMPLE_RATE = 16_000
 CHUNK_MILLISECONDS = 10
 CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MILLISECONDS // 1_000

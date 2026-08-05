@@ -19,8 +19,6 @@ from typing import Any
 
 import ai
 
-CARD_MODEL = ai.DEFAULT_AI_MODEL.model
-RESPONSES_URL = "https://api.openai.com/v1/responses"
 CARD_TIMEOUT_SECONDS = 20
 CARD_CHARACTER_THRESHOLD = 300
 CARD_IDLE_SECONDS = 20

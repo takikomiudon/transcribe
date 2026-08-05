@@ -87,11 +87,9 @@ class SessionRunner:
         self.final_card_generator = final_card_generator
         self.title_fn = title_fn
         self.elevenlabs_key = elevenlabs_key
-        self.openai_key = openai_key
-        self.deepseek_key = deepseek_key
         self.ai_model = ai.model_from_values(session.ai_provider, session.ai_model)
         self.ai_key = ai.api_key_for(
-            self.ai_model, self.openai_key, self.deepseek_key
+            self.ai_model, openai_key, deepseek_key
         )
         self.curl_path = curl_path
         self.refresh_interval = refresh_interval
