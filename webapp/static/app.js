@@ -308,8 +308,9 @@ function openSocket(id, reconnecting = false) {
       showToast("サーバーから不正なメッセージを受信しました。");
     }
   });
-  socket.addEventListener("close", async () => {
+  socket.addEventListener("close", async event => {
     if (state.ws !== socket) return;
+    const serverShutdown = event.code === 1012 || event.code === 1001;
     const wasRecording = Boolean(state.recorder);
     state.ws = null;
     startRequested = false;
@@ -322,11 +323,11 @@ function openSocket(id, reconnecting = false) {
         upsertSession(currentDetail.session);
       }
       showToast("録音が中断されました。サーバーで停止処理を続けています。");
-    } else if (!socket.intentionalClose) {
+    } else if (!socket.intentionalClose && !serverShutdown) {
       showToast("接続が切れました。再接続します。");
     }
     renderHeader();
-    if (!socket.intentionalClose) scheduleReconnect(id);
+    if (!socket.intentionalClose && !serverShutdown) scheduleReconnect(id);
   });
 }
 
