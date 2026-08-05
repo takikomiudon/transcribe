@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 import ai
+import pytest
 
 
 class FakeResponse:
@@ -98,6 +99,47 @@ def test_deepseek_request_uses_chat_completions_and_json_output() -> None:
         "response_format": {"type": "json_object"},
     }
     assert ai.response_text(result, model) == '{"value":"ok"}'
+
+
+def test_deepseek_response_text_reports_finish_reason() -> None:
+    for finish_reason, message in (
+        ("length", "AI応答がmax_tokensで打ち切られました。"),
+        ("content_filter", "AI応答がコンテンツフィルタで遮断されました。"),
+        (
+            "insufficient_system_resource",
+            "AIサーバーが混雑しているため応答を取得できませんでした。",
+        ),
+    ):
+        with pytest.raises(ValueError, match=message):
+            ai.response_text(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": finish_reason,
+                            "message": {"content": '{"value":"ok"}'},
+                        }
+                    ]
+                },
+                ai.DEEPSEEK_FLASH_MODEL,
+            )
+
+
+def test_deepseek_response_text_rejects_null_content() -> None:
+    with pytest.raises(ValueError, match="AI応答が空でした。"):
+        ai.response_text(
+            {
+                "choices": [
+                    {"finish_reason": "stop", "message": {"content": None}}
+                ]
+            },
+            ai.DEEPSEEK_FLASH_MODEL,
+        )
+
+
+def test_strip_code_fence() -> None:
+    assert ai.strip_code_fence('```json\n{"value":"ok"}\n```') == '{"value":"ok"}'
+    assert ai.strip_code_fence('```\n{"value":"ok"}\n```') == '{"value":"ok"}'
+    assert ai.strip_code_fence('{"value":"ok"}') == '{"value":"ok"}'
 
 
 def test_unknown_model_is_rejected() -> None:

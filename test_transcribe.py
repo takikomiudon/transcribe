@@ -67,7 +67,11 @@ def test_deepseek_glossary_uses_json_output() -> None:
     response.__enter__.return_value.read.return_value = json.dumps(
         {
             "choices": [
-                {"message": {"content": '{"terms":["OpenAI","OpenAI"]}'}}
+                {
+                    "message": {
+                        "content": '```json\n{"terms":["OpenAI","OpenAI"]}\n```'
+                    }
+                }
             ]
         }
     ).encode()
@@ -82,6 +86,7 @@ def test_deepseek_glossary_uses_json_output() -> None:
     assert body["thinking"] == {"type": "disabled"}
     assert body["response_format"] == {"type": "json_object"}
     assert "json" in body["messages"][0]["content"].lower()
+    assert "terms" in body["messages"][0]["content"]
     assert result == ["OpenAI"]
 
 

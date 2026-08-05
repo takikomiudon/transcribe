@@ -395,7 +395,7 @@ def glossary_payload(text: str) -> dict[str, Any]:
         "instructions": (
             "ASR文字起こしから、補正に役立つ固有名詞と専門用語を最大30個抽出してください。"
             "一般語、文章、説明は含めず、文字起こしに実際に現れる表記を保持してください。"
-            "結果はJSONで返し、terms配列だけを含めてください。"
+            '結果はJSONで返し、terms配列だけを含めてください。出力例: {"terms": ["用語1", "用語2"]}'
         ),
         "input": text[-4_000:],
         "max_output_tokens": 1_024,
@@ -427,8 +427,10 @@ def extract_glossary(
     model: ai.AIModel = ai.DEFAULT_AI_MODEL,
 ) -> list[str]:
     value = json.loads(
-        request_response_text(
-            glossary_payload(text), api_key, CORRECTION_TIMEOUT_SECONDS, model
+        ai.strip_code_fence(
+            request_response_text(
+                glossary_payload(text), api_key, CORRECTION_TIMEOUT_SECONDS, model
+            )
         )
     )
     terms = value.get("terms") if isinstance(value, dict) else None

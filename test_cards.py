@@ -6,10 +6,11 @@ import asyncio
 import json
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import ai
 import cards
+import pytest
 
 
 def test_text_buffer_triggers() -> None:
@@ -82,6 +83,19 @@ def test_card_generation_payload() -> None:
         "update_last",
         "skip",
     ]
+    assert payload["max_output_tokens"] == 4096
+    assert json.dumps(cards.CARD_JSON_EXAMPLE, ensure_ascii=False) in payload[
+        "instructions"
+    ]
+    assert json.dumps(cards.CARD_SKIP_JSON_EXAMPLE, ensure_ascii=False) in payload[
+        "instructions"
+    ]
+    assert set(cards.CARD_JSON_EXAMPLE) == set(
+        output_format["schema"]["properties"]
+    )
+    assert set(cards.CARD_SKIP_JSON_EXAMPLE) == set(
+        output_format["schema"]["properties"]
+    )
 
 
 def test_generate_card_parses_and_sanitizes_response() -> None:
@@ -131,6 +145,48 @@ def test_generate_card_parses_and_sanitizes_response() -> None:
     }
 
 
+def test_generate_card_strips_code_fence() -> None:
+    response = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": '```json\n{"decision":"new_card","title":"Generated","html":"<p>Safe</p>"}\n```',
+                    }
+                ],
+            }
+        ],
+    }
+    with patch("cards._request_card_generation", return_value=response):
+        result = cards.generate_card("source", "api-key", None, [])
+
+    assert result["title"] == "Generated"
+    assert result["html"] == "<p>Safe</p>"
+
+
+def test_generate_card_rejects_empty_title_html() -> None:
+    response = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": '{"decision":"new_card","title":"","html":""}',
+                    }
+                ],
+            }
+        ],
+    }
+    with patch("cards._request_card_generation", return_value=response):
+        with pytest.raises(cards.CardGenerationError, match="タイトルまたはHTMLが空"):
+            cards.generate_card("source", "api-key", None, [])
+
+
 def test_deepseek_card_generation_uses_json_output() -> None:
     response = MagicMock()
     response.__enter__.return_value.read.return_value = json.dumps(
@@ -161,7 +217,28 @@ def test_deepseek_card_generation_uses_json_output() -> None:
     assert body["thinking"] == {"type": "disabled"}
     assert body["response_format"] == {"type": "json_object"}
     assert "json" in body["messages"][0]["content"].lower()
+    assert "decision" in body["messages"][0]["content"]
     assert result["decision"] == "skip"
+
+
+def test_deepseek_truncated_card_response_reports_length() -> None:
+    response = {
+        "choices": [
+            {
+                "finish_reason": "length",
+                "message": {"content": None},
+            }
+        ]
+    }
+    with patch("cards._request_card_generation", return_value=response):
+        with pytest.raises(cards.CardGenerationError, match="max_tokens"):
+            cards.generate_card(
+                "source",
+                "deepseek-key",
+                None,
+                [],
+                ai.DEEPSEEK_FLASH_MODEL,
+            )
 
 
 def test_final_card_generation_payload() -> None:
@@ -170,11 +247,17 @@ def test_final_card_generation_payload() -> None:
     assert payload["input"] == "Complete final transcript."
     assert payload["store"] is False
     assert "json" in payload["instructions"].lower()
+    assert json.dumps(cards.FINAL_CARDS_JSON_EXAMPLE, ensure_ascii=False) in payload[
+        "instructions"
+    ]
     output_format = payload["text"]["format"]
     assert output_format["type"] == "json_schema"
     assert output_format["strict"] is True
     item = output_format["schema"]["properties"]["cards"]["items"]
     assert item["required"] == ["title", "html", "source_text"]
+    assert set(cards.FINAL_CARDS_JSON_EXAMPLE["cards"][0]) == set(
+        item["properties"]
+    )
 
 
 def test_generate_final_cards_parses_and_sanitizes_all_cards() -> None:
@@ -186,7 +269,8 @@ def test_generate_final_cards_parses_and_sanitizes_all_cards() -> None:
                 "content": [
                     {
                         "type": "output_text",
-                        "text": json.dumps(
+                        "text": "```json\n"
+                        + json.dumps(
                             {
                                 "cards": [
                                     {
@@ -204,7 +288,8 @@ def test_generate_final_cards_parses_and_sanitizes_all_cards() -> None:
                                     },
                                 ]
                             }
-                        ),
+                        )
+                        + "\n```",
                     }
                 ],
             }
@@ -348,7 +433,33 @@ async def test_card_pipeline_applies_decisions_in_order() -> None:
         assert persisted[0]["title"] == "Updated"
 
 
-async def test_card_pipeline_records_error_after_two_failures() -> None:
+async def test_card_pipeline_records_error_after_five_failures() -> None:
+    attempts = 0
+
+    def fail_generation(*_: object) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        raise cards.CardGenerationError("failed")
+
+    with tempfile.TemporaryDirectory() as directory:
+        pipeline = cards.CardPipeline(
+            "api-key",
+            output_dir=Path(directory),
+            generator=fail_generation,
+            retry_base_seconds=0,
+        )
+        pipeline.start()
+        pipeline.add("source")
+        pipeline.flush()
+        result = await pipeline.close()
+
+    assert attempts == 5
+    assert len(result) == 1
+    assert result[0].status == "error"
+    assert result[0].source_text == "source"
+
+
+async def test_card_pipeline_retries_with_backoff() -> None:
     attempts = 0
 
     def fail_generation(*_: object) -> dict[str, object]:
@@ -362,15 +473,47 @@ async def test_card_pipeline_records_error_after_two_failures() -> None:
             output_dir=Path(directory),
             generator=fail_generation,
         )
+        with patch("cards.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            await pipeline._generate("source")
+
+    assert attempts == 5
+    assert sleep.await_args_list == [call(1.0), call(2.0), call(4.0), call(8.0)]
+
+
+async def test_card_pipeline_preserves_order_during_retry() -> None:
+    attempts: dict[str, int] = {}
+
+    def generate(
+        source_text: str,
+        _: str,
+        __: cards.Card | None,
+        ___: list[str],
+        ____: ai.AIModel,
+    ) -> dict[str, object]:
+        attempts[source_text] = attempts.get(source_text, 0) + 1
+        if source_text == "first" and attempts[source_text] < 3:
+            raise cards.CardGenerationError("retry first")
+        return {
+            "decision": "new_card",
+            "title": source_text,
+            "html": f"<p>{source_text}</p>",
+        }
+
+    with tempfile.TemporaryDirectory() as directory:
+        pipeline = cards.CardPipeline(
+            "api-key",
+            output_dir=Path(directory),
+            character_threshold=1,
+            retry_base_seconds=0,
+            generator=generate,
+        )
         pipeline.start()
-        pipeline.add("source")
-        pipeline.flush()
+        pipeline.add("first")
+        pipeline.add("second")
         result = await pipeline.close()
 
-    assert attempts == 2
-    assert len(result) == 1
-    assert result[0].status == "error"
-    assert result[0].source_text == "source"
+    assert [card.title for card in result] == ["first", "second"]
+    assert attempts == {"first": 3, "second": 1}
 
 
 def main() -> None:
@@ -383,7 +526,9 @@ def main() -> None:
     test_generate_final_cards_rejects_empty_or_invalid_cards()
     test_card_store_replaces_all_cards_atomically()
     asyncio.run(test_card_pipeline_applies_decisions_in_order())
-    asyncio.run(test_card_pipeline_records_error_after_two_failures())
+    asyncio.run(test_card_pipeline_records_error_after_five_failures())
+    asyncio.run(test_card_pipeline_retries_with_backoff())
+    asyncio.run(test_card_pipeline_preserves_order_during_retry())
     print("ok")
 
 

@@ -23,6 +23,8 @@ CARD_TIMEOUT_SECONDS = 20
 CARD_CHARACTER_THRESHOLD = 300
 CARD_IDLE_SECONDS = 20
 CARD_MAX_SECONDS = 90
+CARD_MAX_ATTEMPTS = 5
+CARD_RETRY_BASE_SECONDS = 1.0
 
 ALLOWED_TAGS = {
     "div",
@@ -64,7 +66,23 @@ ALLOWED_CLASSES = {
 }
 BLOCKED_CONTENT_TAGS = {"iframe", "math", "object", "script", "style", "svg"}
 
-CARD_INSTRUCTIONS = """\
+CARD_JSON_EXAMPLE = {
+    "decision": "new_card",
+    "title": "話題のタイトル",
+    "html": '<div class="callout"><p>要点の説明</p></div>',
+}
+CARD_SKIP_JSON_EXAMPLE = {"decision": "skip", "title": "", "html": ""}
+FINAL_CARDS_JSON_EXAMPLE = {
+    "cards": [
+        {
+            "title": "話題のタイトル",
+            "html": '<div class="callout"><p>要点の説明</p></div>',
+            "source_text": "対応する文字起こしの抜粋",
+        }
+    ]
+}
+
+CARD_INSTRUCTIONS = f"""\
 あなたは講義のライブ文字起こしを、コンパクトな日本語の図解カードに変換します。
 新しいテキスト・直前のカード・トピック概要を踏まえ、必ず次のいずれか1つを選びます:
 - new_card: 新しい話題であり、独立したカードに値する。
@@ -109,11 +127,16 @@ URL, 画像, その他のタグやクラスは決して出力しません。各�
 3〜7個の要素に収め、内部スクロールを発生させません。明らかな文字起こし
 ミスは根拠のない事実を加えない範囲で自然に修正しますが、確信のない
 固有名詞を推測で「修正」してはいけません — 推測するくらいなら文字起こしの
-表記をそのまま残します。skip の場合はタイトルとHTMLを空文字列で返します。
+表記をそのまま残します。skip の場合のみ、タイトルとHTMLを空文字列で返します。
+出力例:
+- new_card または update_last:
+{json.dumps(CARD_JSON_EXAMPLE, ensure_ascii=False)}
+- skip:
+{json.dumps(CARD_SKIP_JSON_EXAMPLE, ensure_ascii=False)}
 最終応答はJSONで返し、decision・title・htmlのフィールドだけを含めます。
 """
 
-FINAL_CARD_INSTRUCTIONS = """\
+FINAL_CARD_INSTRUCTIONS = f"""\
 あなたは講義の完全な最終文字起こしを、コンパクトな日本語の図解カードに
 変換します。まず文字起こし全体を読み、意味のある話題単位に分割します。
 話者が見出しやセクション名を読み上げている場合は、それを話題の区切りの
@@ -155,6 +178,8 @@ script, インラインスタイル, イベントハンドラ, URL, 画像, そ�
 クラスは決して出力しません。各カードは見出しと3〜7個の要素に収め、内部
 スクロールを発生させません。明らかな文字起こしミスは根拠のない事実を
 加えない範囲で自然に修正します。
+出力例:
+{json.dumps(FINAL_CARDS_JSON_EXAMPLE, ensure_ascii=False)}
 最終応答はJSONで返し、cards配列だけを含めます。
 """
 
@@ -353,7 +378,7 @@ def card_generation_payload(
                 "strict": True,
             }
         },
-        "max_output_tokens": 2_048,
+        "max_output_tokens": 4_096,
         "store": False,
     }
 
@@ -426,7 +451,9 @@ def generate_card(
     )
 
     try:
-        result = json.loads(_response_output_text(payload, model))
+        result = json.loads(
+            ai.strip_code_fence(_response_output_text(payload, model))
+        )
         decision = result["decision"]
         title = str(result["title"]).strip()
         raw_html = str(result["html"])
@@ -459,7 +486,9 @@ def generate_final_cards(
         final_card_generation_payload(transcript, model), api_key, model
     )
     try:
-        result = json.loads(_response_output_text(payload, model))
+        result = json.loads(
+            ai.strip_code_fence(_response_output_text(payload, model))
+        )
         raw_cards = result["cards"]
     except (KeyError, TypeError, json.JSONDecodeError) as error:
         raise CardGenerationError("final図解生成の応答形式が不正です。") from error
@@ -572,6 +601,7 @@ class CardPipeline:
         character_threshold: int = CARD_CHARACTER_THRESHOLD,
         idle_seconds: float = CARD_IDLE_SECONDS,
         max_seconds: float = CARD_MAX_SECONDS,
+        retry_base_seconds: float = CARD_RETRY_BASE_SECONDS,
         generator: Callable[
             [str, str, Card | None, list[str], ai.AIModel], dict[str, object]
         ] = generate_card,
@@ -589,6 +619,7 @@ class CardPipeline:
         )
         self.generator = generator
         self.model = model
+        self.retry_base_seconds = retry_base_seconds
         self.queue: asyncio.Queue[str | None] = asyncio.Queue()
         self.worker_task: asyncio.Task[None] | None = None
         self.timer_task: asyncio.Task[None] | None = None
@@ -644,7 +675,7 @@ class CardPipeline:
     async def _generate(self, source_text: str) -> None:
         last_error: Exception | None = None
         started = time.perf_counter()
-        for _ in range(2):
+        for attempt in range(CARD_MAX_ATTEMPTS):
             try:
                 result = await asyncio.to_thread(
                     self.generator,
@@ -656,6 +687,8 @@ class CardPipeline:
                 )
             except (CardGenerationError, OSError, RuntimeError, ValueError) as error:
                 last_error = error
+                if attempt < CARD_MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(self.retry_base_seconds * (2**attempt))
                 continue
             decision = str(result.get("decision", ""))
             if decision == "skip":

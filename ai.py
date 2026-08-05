@@ -77,6 +77,13 @@ def api_key_for(model: AIModel, openai_key: str, deepseek_key: str) -> str:
     return key
 
 
+def strip_code_fence(text: str) -> str:
+    lines = text.strip().splitlines()
+    if len(lines) >= 2 and lines[0].strip().startswith("```") and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return text
+
+
 def request(
     payload: dict[str, Any],
     api_key: str,
@@ -136,7 +143,15 @@ def response_text(response: dict[str, Any], model: AIModel = DEFAULT_AI_MODEL) -
         text = "".join(parts).strip()
     elif model.provider == DEEPSEEK_PROVIDER:
         choices = response.get("choices", [])
-        message = choices[0].get("message", {}) if choices else {}
+        choice = choices[0] if choices else {}
+        finish_reason = choice.get("finish_reason")
+        if finish_reason == "length":
+            raise ValueError("AI応答がmax_tokensで打ち切られました。")
+        if finish_reason == "content_filter":
+            raise ValueError("AI応答がコンテンツフィルタで遮断されました。")
+        if finish_reason == "insufficient_system_resource":
+            raise ValueError("AIサーバーが混雑しているため応答を取得できませんでした。")
+        message = choice.get("message", {})
         text = str(message.get("content") or "").strip()
     else:
         raise ValueError("利用できないAIプロバイダです。")
