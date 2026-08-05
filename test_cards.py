@@ -160,6 +160,7 @@ def test_deepseek_card_generation_uses_json_output() -> None:
     assert body["model"] == "deepseek-v4-flash"
     assert body["thinking"] == {"type": "disabled"}
     assert body["response_format"] == {"type": "json_object"}
+    assert "json" in body["messages"][0]["content"].lower()
     assert result["decision"] == "skip"
 
 
@@ -168,6 +169,7 @@ def test_final_card_generation_payload() -> None:
 
     assert payload["input"] == "Complete final transcript."
     assert payload["store"] is False
+    assert "json" in payload["instructions"].lower()
     output_format = payload["text"]["format"]
     assert output_format["type"] == "json_schema"
     assert output_format["strict"] is True

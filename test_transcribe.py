@@ -81,6 +81,7 @@ def test_deepseek_glossary_uses_json_output() -> None:
     assert body["model"] == "deepseek-v4-flash"
     assert body["thinking"] == {"type": "disabled"}
     assert body["response_format"] == {"type": "json_object"}
+    assert "json" in body["messages"][0]["content"].lower()
     assert result == ["OpenAI"]
 
 
