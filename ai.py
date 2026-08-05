@@ -56,7 +56,8 @@ def api_key_for(model: AIModel, openai_key: str, deepseek_key: str) -> str:
     else:
         raise ValueError("利用できないAIプロバイダです。")
     if not key:
-        raise ValueError("選択したAIモデルのAPIキーが設定されていません。")
+        provider = "DeepSeek" if model.provider == DEEPSEEK_PROVIDER else "OpenAI"
+        raise ValueError(f"{provider} APIキーが設定されていません。")
     return key
 
 
@@ -71,8 +72,6 @@ def request(
         url = OPENAI_RESPONSES_URL
     elif model.provider == DEEPSEEK_PROVIDER:
         instructions = str(payload.get("instructions", ""))
-        if "text" in payload and "json" not in instructions.lower():
-            instructions = f"{instructions}\nJSON形式で出力してください。"
         request_payload = {
             "model": model.model,
             "messages": [

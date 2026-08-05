@@ -7,6 +7,7 @@ import re
 import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -107,8 +108,8 @@ def api_status(request: Request) -> dict[str, str | None]:
 def api_config(request: Request) -> dict[str, Any]:
     models = ai.available_models(request.app.state.deepseek_key)
     return {
-        "default_model": _model_value(ai.DEFAULT_AI_MODEL),
-        "models": [_model_value(model) for model in models],
+        "default_model": asdict(ai.DEFAULT_AI_MODEL),
+        "models": [asdict(model) for model in models],
     }
 
 
@@ -169,16 +170,16 @@ def select_model(
         )
     try:
         model = ai.model_from_values(body.provider, body.model)
+        ai.api_key_for(
+            model,
+            request.app.state.openai_key,
+            request.app.state.deepseek_key,
+        )
     except ValueError as error:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(error),
         ) from error
-    if model.provider == ai.DEEPSEEK_PROVIDER and not request.app.state.deepseek_key:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="DeepSeek APIキーが設定されていません。",
-        )
     session.ai_provider = model.provider
     session.ai_model = model.model
     session.updated_at = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -251,14 +252,6 @@ def _summary(session: Session) -> dict[str, Any]:
     summary.pop("paths")
     summary["resumable"] = session.resumable
     return summary
-
-
-def _model_value(model: ai.AIModel) -> dict[str, str]:
-    return {
-        "provider": model.provider,
-        "model": model.model,
-        "label": model.label,
-    }
 
 
 def _path(request: Request, session: Session, name: str) -> Path:
