@@ -250,8 +250,9 @@ async function refreshTranscript() {
     if (text === transcriptVersion) return;
     transcriptVersion = text;
     transcript.textContent = text || "最初の文字起こしを待っています。";
-  } catch (error) {
-    console.warn("文字起こしを取得できません", error);
+  } catch (transcriptFetchError) {
+    if (!(transcriptFetchError instanceof Error)) throw transcriptFetchError;
+    console.warn("文字起こしを取得できません", transcriptFetchError);
   }
 }
 
@@ -261,8 +262,9 @@ async function refreshCards() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     liveCards = await response.json();
     if (activeView === "live") render(liveCards);
-  } catch (error) {
-    console.warn("カードを取得できません", error);
+  } catch (liveCardsFetchError) {
+    if (!(liveCardsFetchError instanceof Error)) throw liveCardsFetchError;
+    console.warn("カードを取得できません", liveCardsFetchError);
   }
 }
 
@@ -279,8 +281,9 @@ async function refreshFinalCards() {
       finalReady = true;
       selectCardView("final", true);
     } else if (activeView === "final") render(finalCards, true);
-  } catch (error) {
-    console.warn("品質版カードを取得できません", error);
+  } catch (finalCardsFetchError) {
+    if (!(finalCardsFetchError instanceof Error)) throw finalCardsFetchError;
+    console.warn("品質版カードを取得できません", finalCardsFetchError);
   }
 }
 

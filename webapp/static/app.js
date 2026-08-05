@@ -2,6 +2,10 @@
 
 const state = {
   sessions: [],
+  models: [],
+  defaultModel: {provider: "openai", model: "gpt-5.6-luna", label: "GPT-5.6 Luna"},
+  deepseekPeakHoursUtc: [],
+  deepseekPeak: false,
   currentId: null,
   status: {active_session_id: null, state: "idle"},
   ws: null,
@@ -19,6 +23,7 @@ const elements = {
   sessionTitleButton: document.getElementById("session-title-button"),
   sessionTitleInput: document.getElementById("session-title-input"),
   sessionMeta: document.getElementById("session-meta"),
+  modelSelect: document.getElementById("model-select"),
   statusBadge: document.getElementById("status-badge"),
   recordButton: document.getElementById("record-button"),
   toast: document.getElementById("toast"),
@@ -78,7 +83,10 @@ class Recorder {
       if (!AudioContextClass) throw new Error("このブラウザは音声録音に対応していません。");
       try {
         this.context = new AudioContextClass({sampleRate: 16000});
-      } catch (_error) {
+      } catch (audioContextOptionsError) {
+        if (!(audioContextOptionsError instanceof TypeError || audioContextOptionsError instanceof DOMException)) {
+          throw audioContextOptionsError;
+        }
         this.context = new AudioContextClass();
       }
       await this.context.audioWorklet.addModule("/static/recorder-worklet.js");
@@ -106,9 +114,10 @@ class Recorder {
       this.source.connect(this.node);
       this.node.connect(this.sink).connect(this.context.destination);
       if (this.context.state === "suspended") await this.context.resume();
-    } catch (error) {
+    } catch (recorderError) {
+      if (!(recorderError instanceof Error)) throw recorderError;
       await this.stop();
-      throw error;
+      throw recorderError;
     }
   }
 
@@ -144,7 +153,8 @@ async function request(path, options = {}) {
     try {
       const payload = await response.json();
       if (payload.detail) message = payload.detail;
-    } catch (_error) {
+    } catch (responseJsonError) {
+      if (!(responseJsonError instanceof SyntaxError)) throw responseJsonError;
       // HTTP status is enough when the response isn't JSON.
     }
     throw new Error(message);
@@ -156,23 +166,30 @@ async function request(path, options = {}) {
 async function initialize() {
   bindControls();
   try {
-    const [sessionsPayload, statusPayload] = await Promise.all([
+    const [sessionsPayload, statusPayload, configPayload] = await Promise.all([
       request("/api/sessions"),
       request("/api/status"),
+      request("/api/config"),
     ]);
     state.sessions = sortSessions(sessionsPayload.sessions);
     state.status = statusPayload;
+    state.models = configPayload.models;
+    state.defaultModel = configPayload.default_model;
+    state.deepseekPeakHoursUtc = configPayload.deepseek_peak_hours_utc;
+    state.deepseekPeak = isDeepSeekPeakTime();
     renderSidebar();
     if (state.sessions.length) await selectSession(state.sessions[0].id);
     else await createSession();
-  } catch (error) {
-    showToast(error.message);
+  } catch (initializationError) {
+    if (!(initializationError instanceof Error)) throw initializationError;
+    showToast(initializationError.message);
   }
 }
 
 function bindControls() {
   elements.newSession.addEventListener("click", createSession);
   elements.recordButton.addEventListener("click", handleRecordButton);
+  elements.modelSelect.addEventListener("change", changeModel);
   elements.sessionTitleButton.addEventListener("click", beginHeaderRename);
   elements.sessionTitleInput.addEventListener("blur", finishHeaderRename);
   elements.sessionTitleInput.addEventListener("keydown", event => {
@@ -225,8 +242,9 @@ async function createSession() {
     const session = await request("/api/sessions", {method: "POST"});
     upsertSession(session);
     await selectSession(session.id);
-  } catch (error) {
-    showToast(error.message);
+  } catch (sessionCreationError) {
+    if (!(sessionCreationError instanceof Error)) throw sessionCreationError;
+    showToast(sessionCreationError.message);
   } finally {
     elements.newSession.disabled = false;
   }
@@ -254,8 +272,9 @@ async function selectSession(id) {
     if (version !== selectionVersion) return;
     applySessionDetail(detail);
     openSocket(id);
-  } catch (error) {
-    if (version === selectionVersion) showToast(error.message);
+  } catch (sessionSelectionError) {
+    if (!(sessionSelectionError instanceof Error)) throw sessionSelectionError;
+    if (version === selectionVersion) showToast(sessionSelectionError.message);
   }
 }
 
@@ -273,15 +292,19 @@ function openSocket(id, reconnecting = false) {
     try {
       await resyncCurrentSession(id);
       if (!interrupted) showToast("サーバーへ再接続しました。");
-    } catch (error) {
-      showToast(error.message);
+    } catch (resyncError) {
+      if (!(resyncError instanceof Error)) throw resyncError;
+      showToast(resyncError.message);
     }
   });
   socket.addEventListener("message", async event => {
     if (state.ws !== socket) return;
     try {
       await handleServerEvent(JSON.parse(event.data));
-    } catch (_error) {
+    } catch (serverMessageError) {
+      if (!(serverMessageError instanceof SyntaxError || serverMessageError instanceof TypeError)) {
+        throw serverMessageError;
+      }
       showToast("サーバーから不正なメッセージを受信しました。");
     }
   });
@@ -443,7 +466,8 @@ async function startLocalRecorder() {
     await recorder.start();
     startRequested = false;
     renderHeader();
-  } catch (_error) {
+  } catch (recorderStartError) {
+    if (!(recorderStartError instanceof Error)) throw recorderStartError;
     state.recorder = null;
     startRequested = false;
     showToast("マイクを利用できません。ブラウザのマイク権限を確認してください。");
@@ -596,8 +620,9 @@ function beginSidebarRename(session, item) {
       try {
         await renameSession(session.id, title);
         return;
-      } catch (error) {
-        showToast(error.message);
+      } catch (sidebarRenameError) {
+        if (!(sidebarRenameError instanceof Error)) throw sidebarRenameError;
+        showToast(sidebarRenameError.message);
       }
     } else if (save) {
       showToast("タイトルを入力してください。");
@@ -629,6 +654,29 @@ async function renameSession(id, title) {
   return session;
 }
 
+async function changeModel() {
+  const session = currentDetail?.session;
+  const model = state.models.find(item => modelKey(item) === elements.modelSelect.value);
+  if (!session || session.has_audio || !model) return;
+  if (isDeepSeekPeakTime() && session.ai_provider === "deepseek") {
+    renderHeader();
+    return;
+  }
+  try {
+    const updated = await request(`/api/sessions/${encodeURIComponent(session.id)}/model`, {
+      method: "PATCH",
+      body: JSON.stringify({provider: model.provider, model: model.model}),
+    });
+    currentDetail.session = updated;
+    upsertSession(updated);
+    renderHeader();
+  } catch (modelChangeError) {
+    if (!(modelChangeError instanceof Error)) throw modelChangeError;
+    showToast(modelChangeError.message);
+    renderHeader();
+  }
+}
+
 async function deleteSession(session) {
   closeSessionMenus();
   const title = session.title || stemTitle(session.id);
@@ -647,8 +695,9 @@ async function deleteSession(session) {
     renderAll();
     if (state.sessions.length) await selectSession(state.sessions[0].id);
     else await createSession();
-  } catch (error) {
-    showToast(error.message);
+  } catch (sessionDeletionError) {
+    if (!(sessionDeletionError instanceof Error)) throw sessionDeletionError;
+    showToast(sessionDeletionError.message);
   }
 }
 
@@ -675,8 +724,9 @@ async function finishHeaderRename() {
   }
   try {
     await renameSession(id, title);
-  } catch (error) {
-    showToast(error.message);
+  } catch (headerRenameError) {
+    if (!(headerRenameError instanceof Error)) throw headerRenameError;
+    showToast(headerRenameError.message);
   }
 }
 
@@ -694,6 +744,7 @@ function renderHeader() {
     elements.sessionMeta.textContent = "履歴からセッションを選んでください。";
     elements.recordButton.disabled = true;
     elements.recordButton.dataset.action = "";
+    renderModelSelector(null, false, false);
     return;
   }
 
@@ -704,6 +755,7 @@ function renderHeader() {
   const activeHere = activeId === session.id;
   const finalizing = activeHere && ["stopping", "finalizing"].includes(state.status.state);
   const recording = activeHere && state.status.state === "recording";
+  renderModelSelector(session, recording, finalizing);
 
   elements.statusBadge.className = "status-badge stopped";
   elements.statusBadge.textContent = "停止";
@@ -744,6 +796,35 @@ function renderHeader() {
     button.title = "録音ファイルが削除済みのため再開できません";
   }
   elements.levelRow.hidden = !recording;
+}
+
+function modelKey(model) {
+  return `${model.provider}:${model.model}`;
+}
+
+function isDeepSeekPeakTime() {
+  const hour = new Date().getUTCHours();
+  return state.deepseekPeakHoursUtc.some(([start, end]) => start <= hour && hour < end);
+}
+
+function renderModelSelector(session, recording, finalizing) {
+  const select = elements.modelSelect;
+  if (select.options.length !== state.models.length) {
+    select.replaceChildren(...state.models.map(model => {
+      const option = document.createElement("option");
+      option.value = modelKey(model);
+      option.textContent = model.label;
+      return option;
+    }));
+  }
+  if (!session || !state.models.length) {
+    select.disabled = true;
+    return;
+  }
+  const forcedToLuna = session.ai_provider === "deepseek" && isDeepSeekPeakTime();
+  const value = modelKey(forcedToLuna ? state.defaultModel : session);
+  if ([...select.options].some(option => option.value === value)) select.value = value;
+  select.disabled = session.has_audio || recording || finalizing || startRequested || forcedToLuna;
 }
 
 function renderAudio() {
@@ -1017,3 +1098,9 @@ function setSidebarOpen(open) {
 }
 
 initialize();
+setInterval(() => {
+  const peak = isDeepSeekPeakTime();
+  if (peak === state.deepseekPeak) return;
+  state.deepseekPeak = peak;
+  renderHeader();
+}, 30_000);

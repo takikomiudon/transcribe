@@ -1,0 +1,109 @@
+"""Offline checks for provider-specific AI requests."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from unittest.mock import patch
+
+import ai
+
+
+class FakeResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    def __enter__(self) -> FakeResponse:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps(self.payload).encode()
+
+
+def test_default_model_is_openai_luna() -> None:
+    assert ai.DEFAULT_AI_MODEL == ai.AIModel(
+        provider="openai",
+        model="gpt-5.6-luna",
+        label="GPT-5.6 Luna",
+    )
+    assert ai.model_from_values("openai", "gpt-5.6-luna") == ai.DEFAULT_AI_MODEL
+
+
+def test_deepseek_is_available_only_with_a_key() -> None:
+    assert [model.model for model in ai.available_models("")] == ["gpt-5.6-luna"]
+    assert [model.model for model in ai.available_models("deepseek-key")] == [
+        "gpt-5.6-luna",
+        "deepseek-v4-flash",
+    ]
+
+
+def test_deepseek_peak_hours_use_utc_half_open_boundaries() -> None:
+    def at(hour: int, minute: int = 0) -> datetime:
+        return datetime(2026, 8, 5, hour, minute, tzinfo=timezone.utc)
+
+    assert not ai.is_deepseek_peak_hour(at(0, 59))
+    assert ai.is_deepseek_peak_hour(at(1, 0))
+    assert ai.is_deepseek_peak_hour(at(3, 59))
+    assert not ai.is_deepseek_peak_hour(at(4, 0))
+    assert not ai.is_deepseek_peak_hour(at(5, 59))
+    assert ai.is_deepseek_peak_hour(at(6, 0))
+    assert ai.is_deepseek_peak_hour(at(9, 59))
+    assert not ai.is_deepseek_peak_hour(at(10, 0))
+
+
+def test_effective_model_only_replaces_deepseek_during_peak_hours() -> None:
+    peak = datetime(2026, 8, 5, 1, 0, tzinfo=timezone.utc)
+    regular = datetime(2026, 8, 5, 4, 0, tzinfo=timezone.utc)
+
+    assert ai.effective_model(ai.DEEPSEEK_FLASH_MODEL, peak) == ai.DEFAULT_AI_MODEL
+    assert ai.effective_model(ai.DEEPSEEK_FLASH_MODEL, regular) == ai.DEEPSEEK_FLASH_MODEL
+    assert ai.effective_model(ai.DEFAULT_AI_MODEL, peak) == ai.DEFAULT_AI_MODEL
+
+
+def test_deepseek_request_uses_chat_completions_and_json_output() -> None:
+    response = FakeResponse(
+        {
+            "choices": [{"message": {"content": '{"value":"ok"}'}}],
+            "usage": {"total_tokens": 7},
+        }
+    )
+    payload = {
+        "model": "gpt-5.6-luna",
+        "instructions": "Return JSON.",
+        "input": "source",
+        "max_output_tokens": 32,
+        "text": {"format": {"type": "json_schema"}},
+    }
+    model = ai.model_from_values("deepseek", "deepseek-v4-flash")
+
+    with patch("ai.urllib.request.urlopen", return_value=response) as urlopen:
+        result = ai.request(payload, "deepseek-key", 10, model)
+
+    request = urlopen.call_args.args[0]
+    assert request.full_url == "https://api.deepseek.com/chat/completions"
+    assert request.headers["Authorization"] == "Bearer deepseek-key"
+    body = json.loads(request.data)
+    assert body == {
+        "model": "deepseek-v4-flash",
+        "messages": [
+            {"role": "system", "content": "Return JSON."},
+            {"role": "user", "content": "source"},
+        ],
+        "max_tokens": 32,
+        "stream": False,
+        "thinking": {"type": "disabled"},
+        "response_format": {"type": "json_object"},
+    }
+    assert ai.response_text(result, model) == '{"value":"ok"}'
+
+
+def test_unknown_model_is_rejected() -> None:
+    try:
+        ai.model_from_values("deepseek", "unknown")
+    except ValueError as error:
+        assert str(error) == "利用できないAIモデルです。"
+    else:
+        raise AssertionError("unknown model was accepted")

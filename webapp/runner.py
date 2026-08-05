@@ -15,6 +15,8 @@ from typing import Any, TextIO
 import cards
 import transcribe
 import viewer
+import ai
+from websockets.exceptions import WebSocketException
 from webapp.store import Session, SessionStore
 from webapp.titles import generate_title
 from webapp.wav import WavAppender
@@ -65,6 +67,7 @@ class SessionRunner:
         title_fn: Callable[..., str | None] | None = generate_title,
         elevenlabs_key: str = "",
         openai_key: str = "",
+        deepseek_key: str = "",
         curl_path: str = "curl",
         refresh_interval: float = 30.0,
         registry: RunnerRegistry | None = None,
@@ -85,7 +88,10 @@ class SessionRunner:
         self.final_card_generator = final_card_generator
         self.title_fn = title_fn
         self.elevenlabs_key = elevenlabs_key
+        self.ai_model = ai.model_from_values(session.ai_provider, session.ai_model)
         self.openai_key = openai_key
+        self.deepseek_key = deepseek_key
+        self._ai_credentials()
         self.curl_path = curl_path
         self.refresh_interval = refresh_interval
         self.registry = registry
@@ -118,6 +124,28 @@ class SessionRunner:
         self._stopped = False
         self._accepting_audio = False
         self._last_cards: list[dict[str, Any]] = []
+
+    def _ai_credentials(self) -> tuple[str, ai.AIModel]:
+        model = ai.effective_model(self.ai_model)
+        key = ai.api_key_for(model, self.openai_key, self.deepseek_key)
+        return key, model
+
+    def _generate_card(
+        self,
+        source_text: str,
+        _: str,
+        previous: cards.Card | None,
+        glossary: list[str],
+        __: ai.AIModel,
+    ) -> dict[str, object]:
+        key, model = self._ai_credentials()
+        return self.card_generator(source_text, key, previous, glossary, model)
+
+    def _extract_glossary(
+        self, text: str, _: str, __: ai.AIModel
+    ) -> list[str]:
+        key, model = self._ai_credentials()
+        return self.glossary_fn(text, key, model)
 
     async def start(self) -> None:
         if self._started:
@@ -152,10 +180,12 @@ class SessionRunner:
             card_store = cards.CardStore.attach(
                 self._path("cards"), self._path("cards_html")
             )
+            key, model = self._ai_credentials()
             self.pipeline = cards.CardPipeline(
-                self.openai_key,
+                key,
                 store=card_store,
-                generator=self.card_generator,
+                generator=self._generate_card,
+                model=model,
             )
             self.pipeline.start()
             self._last_cards = _card_values(card_store.snapshot())
@@ -188,7 +218,14 @@ class SessionRunner:
             await self._emit_session()
         except RunnerBusyError:
             raise
-        except Exception as error:
+        except (
+            WebSocketException,
+            OSError,
+            RuntimeError,
+            ValueError,
+            transcribe.TranscriptionError,
+            cards.CardGenerationError,
+        ) as error:
             await self._emit_error(error, fatal=True)
             await self._abort_start()
             raise
@@ -212,7 +249,13 @@ class SessionRunner:
             if self._uplink_task is not None:
                 try:
                     await self._uplink_task
-                except Exception as error:
+                except (
+                    WebSocketException,
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    transcribe.TranscriptionError,
+                ) as error:
                     await self._emit_error(error, fatal=True)
 
             if (
@@ -267,19 +310,32 @@ class SessionRunner:
                 )
                 transcribe.write_batch_transcript(self._path("transcript"), text)
                 await self._emit({"type": "final_transcript", "text": text})
-            except Exception as error:
+            except (
+                transcribe.BatchTranscriptionError,
+                OSError,
+                RuntimeError,
+            ) as error:
                 await self._emit_error(error, fatal=False)
 
             if text is not None:
                 try:
+                    key, model = self._ai_credentials()
                     final_cards = await asyncio.to_thread(
-                        self.final_card_generator, text, self.openai_key
+                        self.final_card_generator,
+                        text,
+                        key,
+                        model,
                     )
                     cards.save_cards(final_cards, self._path("final_cards"))
                     await self._emit(
                         {"type": "cards_final", "cards": _card_values(final_cards)}
                     )
-                except Exception as error:
+                except (
+                    cards.CardGenerationError,
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                ) as error:
                     await self._emit_error(error, fatal=False)
 
             live_cards: list[cards.Card] = []
@@ -292,7 +348,12 @@ class SessionRunner:
                     self._path("cards_html"),
                     final_cards=final_cards,
                 )
-            except Exception as error:
+            except (
+                cards.CardGenerationError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as error:
                 await self._emit_error(error, fatal=False)
 
             if self.title_fn is not None:
@@ -302,8 +363,12 @@ class SessionRunner:
                         title_text = text or _transcript_body(
                             self._path("transcript")
                         ) or ""
+                        key, model = self._ai_credentials()
                         title = await asyncio.to_thread(
-                            self.title_fn, title_text, self.openai_key
+                            self.title_fn,
+                            title_text,
+                            key,
+                            model,
                         )
                         if title and title.strip():
                             self.session.title = title.strip()
@@ -311,7 +376,12 @@ class SessionRunner:
                             self.session.updated_at = _now()
                             self._save_session()
                             await self._emit_session()
-                    except Exception as error:
+                    except (
+                        transcribe.TranslationError,
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                    ) as error:
                         await self._emit_error(error, fatal=False)
 
             self.session.state = "stopped"
@@ -387,19 +457,32 @@ class SessionRunner:
                     return
                 seq, text = item
                 try:
+                    key, model = self._ai_credentials()
                     corrected = await asyncio.to_thread(
                         self.correct_fn,
                         text,
                         context,
                         list(self.glossary),
-                        self.openai_key,
+                        key,
+                        model,
                     )
-                except Exception as error:
+                except (
+                    transcribe.TranslationError,
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                ) as error:
                     await self._emit_error(error, fatal=False)
                     corrected = text
                 try:
                     await self._finalize(seq, corrected)
-                except Exception as error:
+                except (
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    WebSocketException,
+                    transcribe.TranscriptionError,
+                ) as error:
                     await self._emit_error(error, fatal=True)
                     asyncio.create_task(self.stop())
                 else:
@@ -418,7 +501,7 @@ class SessionRunner:
         try:
             self.pipeline.add(corrected_text)
             await self._broadcast_cards_if_changed()
-        except Exception as error:
+        except (OSError, RuntimeError, WebSocketException) as error:
             await self._emit_error(error, fatal=False)
         self._save_session()
         if self.session.title is None:
@@ -441,7 +524,13 @@ class SessionRunner:
             task.result()
         except asyncio.CancelledError:
             return
-        except Exception as error:
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            WebSocketException,
+            transcribe.TranscriptionError,
+        ) as error:
             failure = error
         else:
             failure = transcribe.TranscriptionError(
@@ -454,8 +543,9 @@ class SessionRunner:
         original_batch = transcribe.batch_transcribe
         original_glossary = transcribe.extract_glossary
         transcribe.batch_transcribe = self.batch_fn
-        transcribe.extract_glossary = self.glossary_fn
+        transcribe.extract_glossary = self._extract_glossary
         try:
+            key, model = self._ai_credentials()
             await transcribe.periodically_refresh_final(
                 self._path("transcript"),
                 self._path("audio"),
@@ -466,7 +556,8 @@ class SessionRunner:
                 self.refresh_stop,
                 interval_seconds=self.refresh_interval,
                 glossary=self.glossary,
-                openai_api_key=self.openai_key,
+                openai_api_key=key,
+                model=model,
             )
         finally:
             transcribe.batch_transcribe = original_batch
@@ -522,13 +613,13 @@ class SessionRunner:
         if self.websocket is not None:
             try:
                 await self.websocket.close()
-            except Exception as error:
+            except (OSError, RuntimeError, WebSocketException) as error:
                 await self._emit_error(error, fatal=False)
             self.websocket = None
         if hasattr(self._connection, "__aexit__"):
             try:
                 await self._connection.__aexit__(None, None, None)
-            except Exception as error:
+            except (OSError, RuntimeError, WebSocketException) as error:
                 await self._emit_error(error, fatal=False)
 
     async def _abort_start(self) -> None:
@@ -536,13 +627,18 @@ class SessionRunner:
         if self.pipeline is not None:
             try:
                 await self.pipeline.close()
-            except Exception as error:
+            except (
+                cards.CardGenerationError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as error:
                 await self._emit_error(error, fatal=False)
         if self.websocket is not None:
             await self._close_websocket()
         try:
             self.appender.close()
-        except Exception:
+        except (OSError, ValueError):
             pass
         if self._transcript_file is not None:
             self._transcript_file.close()

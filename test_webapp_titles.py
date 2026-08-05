@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import transcribe
+import ai
 from webapp.titles import generate_title, title_payload
 
 
@@ -33,7 +34,9 @@ def test_generate_title_uses_responses_helper() -> None:
     ) as request:
         assert generate_title("会議本文", "test-key") == "文字起こしWeb会議"
 
-    request.assert_called_once_with(title_payload("会議本文"), "test-key", 10)
+    request.assert_called_once_with(
+        title_payload("会議本文"), "test-key", 10, ai.DEFAULT_AI_MODEL
+    )
 
 
 def test_generate_title_returns_none_on_failure_or_empty_input() -> None:

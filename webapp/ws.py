@@ -7,7 +7,11 @@ from collections.abc import Callable
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from websockets.exceptions import WebSocketException
 
+import ai
+import cards
+import transcribe
 from webapp.runner import (
     RunnerBusyError,
     SessionNotResumableError,
@@ -57,7 +61,7 @@ class WebSocketHub:
         for websocket in list(self.connections.get(id, ())):
             try:
                 await websocket.send_json(event)
-            except Exception:
+            except (OSError, RuntimeError, WebSocketDisconnect):
                 disconnected.append(websocket)
         for websocket in disconnected:
             await self.disconnect(id, websocket)
@@ -142,26 +146,42 @@ async def _start(websocket: WebSocket, id: str, command: dict[str, Any]) -> None
         await _send_error(websocket, "このセッションには既に録音接続があります。")
         return
 
+    try:
+        model = ai.model_from_values(session.ai_provider, session.ai_model)
+        model = ai.effective_model(model)
+        ai.api_key_for(model, state.openai_key, state.deepseek_key)
+    except ValueError as error:
+        await _send_error(websocket, str(error))
+        return
+
     factory: Callable[..., SessionRunner] = getattr(
         state, "runner_factory", SessionRunner
     )
-    runner = factory(
-        session,
-        state.store,
-        state.root,
-        elevenlabs_key=state.elevenlabs_key,
-        openai_key=state.openai_key,
-        curl_path=state.curl_path,
-        registry=state.registry,
-        broadcast=lambda event: hub.broadcast(id, event),
-    )
     try:
+        runner = factory(
+            session,
+            state.store,
+            state.root,
+            elevenlabs_key=state.elevenlabs_key,
+            openai_key=state.openai_key,
+            deepseek_key=state.deepseek_key,
+            curl_path=state.curl_path,
+            registry=state.registry,
+            broadcast=lambda event: hub.broadcast(id, event),
+        )
         hub.reserve(id, websocket, runner)
         await runner.start()
-    except (RunnerBusyError, SessionNotResumableError) as error:
+    except (RunnerBusyError, SessionNotResumableError, ValueError) as error:
         hub.finish(id, websocket)
         await _send_error(websocket, str(error))
-    except Exception:
+    except (
+        WebSocketException,
+        OSError,
+        RuntimeError,
+        ValueError,
+        transcribe.TranscriptionError,
+        cards.CardGenerationError,
+    ):
         hub.finish(id, websocket)
 
 

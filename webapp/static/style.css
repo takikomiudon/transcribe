@@ -35,7 +35,8 @@ audio { font: inherit; }
 button { color: inherit; }
 
 button:focus-visible,
-a:focus-visible {
+a:focus-visible,
+select:focus-visible {
   outline: 3px solid rgb(49 95 202 / 35%);
   outline-offset: 2px;
 }
@@ -367,6 +368,35 @@ a:focus-visible {
   margin: 1px 0 0;
   color: var(--muted);
   font-size: .78rem;
+}
+
+.model-select {
+  display: grid;
+  flex: none;
+  gap: 1px;
+  color: var(--muted);
+  font-size: .68rem;
+  font-weight: 750;
+  line-height: 1.2;
+}
+
+.model-select select {
+  min-width: 170px;
+  min-height: 36px;
+  padding: 5px 27px 5px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: .78rem;
+  font-weight: 500;
+}
+
+.model-select select:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+  opacity: .7;
 }
 
 .status-badge {
@@ -743,6 +773,16 @@ details pre { margin: 0; padding: 0 24px 20px; color: var(--muted); font: inheri
 
   .session-meta { display: none; }
   .status-badge { display: none; }
+
+  .model-select {
+    min-width: 0;
+    flex: 1;
+  }
+
+  .model-select select {
+    min-width: 0;
+    width: 100%;
+  }
 
   .record-button {
     min-width: 92px;

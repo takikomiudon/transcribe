@@ -78,7 +78,7 @@ class WavAppender:
             self._size_offset = size_offset
             self._payload_bytes = payload_bytes
             self.sync_header()
-        except Exception:
+        except (OSError, ValueError, struct.error):
             audio_file.close()
             self._file = None
             raise

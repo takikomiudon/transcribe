@@ -10,6 +10,7 @@ macOSの日本語・英語・韓国語音声をElevenLabs Scribe Realtimeでリ�
 - `curl`（macOS標準）
 - `ELEVENLABS_API_KEY` を設定した `.env.local`
 - 補正・翻訳・図解に使う `OPENAI_API_KEY`
+- WebアプリでDeepSeekを使う場合は `DEEPSEEK_API_KEY`
 
 `.env.local` はGit管理外です。APIキーの値をソースコードやコミットへ入れないでください。
 
@@ -29,6 +30,7 @@ Raycastから起動する場合は、使用する音声入力番号も設定で�
 ```sh
 ELEVENLABS_API_KEY='your-elevenlabs-api-key'
 OPENAI_API_KEY='your-openai-api-key'
+DEEPSEEK_API_KEY='your-deepseek-api-key'
 TRANSCRIBE_DEVICE=0
 ```
 
@@ -82,6 +84,8 @@ uv run -m webapp
 ブラウザで <http://127.0.0.1:8770> を開いてください。ブラウザの `getUserMedia` でマイク音声を取得し、16kHz PCMへ変換してWebSocketでサーバーへストリーミングします。利用にはブラウザのマイク許可が必要です。localhostはsecure contextとして扱われるため、ローカル利用ではHTTPSは不要です。
 
 Webアプリではセッション履歴を残し、録音の開始・停止・同じセッションへの再開ができます。録音したWAVは最終処理後も常に保持し、削除する場合はセッションメニューから明示的に操作します。
+
+録音開始前はヘッダーのAIモデル選択から `GPT-5.6 Luna` と `DeepSeek V4 Flash` をセッション単位で切り替えられます。新規セッションの既定値はOpenAI `gpt-5.6-luna`です。`DEEPSEEK_API_KEY` を設定した場合だけ、公式APIの `deepseek-v4-flash` が選択肢に表示されます。録音開始後はモデルを変更できず、停止後に再開しても録音開始時のモデルを使います。
 
 CLIはWebアプリから独立しており、従来どおり `uv run transcribe.py` で利用できます。CLIはstdlibとwebsocketsだけを使う方針を維持します。WebアプリはFastAPIとuvicornを使用し、依存は `pyproject.toml` で管理します。
 

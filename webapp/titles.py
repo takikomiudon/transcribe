@@ -4,15 +4,19 @@ from __future__ import annotations
 
 from typing import Any
 
+import ai
 import transcribe
 
 
 TITLE_TIMEOUT_SECONDS = 10
 
 
-def title_payload(text: str) -> dict[str, Any]:
+def title_payload(
+    text: str,
+    model: ai.AIModel = ai.DEFAULT_AI_MODEL,
+) -> dict[str, Any]:
     return {
-        "model": transcribe.TRANSLATION_MODEL,
+        "model": model.model,
         "reasoning": {"effort": "none"},
         "instructions": (
             "この文字起こしの内容を表す簡潔な日本語タイトルを最大20文字で"
@@ -25,13 +29,17 @@ def title_payload(text: str) -> dict[str, Any]:
     }
 
 
-def generate_title(text: str, api_key: str) -> str | None:
+def generate_title(
+    text: str,
+    api_key: str,
+    model: ai.AIModel = ai.DEFAULT_AI_MODEL,
+) -> str | None:
     if not text.strip():
         return None
     try:
         title = transcribe.request_response_text(
-            title_payload(text), api_key, TITLE_TIMEOUT_SECONDS
+            title_payload(text, model), api_key, TITLE_TIMEOUT_SECONDS, model
         ).strip()
-    except Exception:
+    except (transcribe.TranslationError, OSError, TimeoutError, ValueError):
         return None
     return title[:20] or None
