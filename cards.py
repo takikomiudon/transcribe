@@ -17,8 +17,9 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+import ai
 
-CARD_MODEL = "gpt-5.6-luna"
+CARD_MODEL = ai.DEFAULT_AI_MODEL.model
 RESPONSES_URL = "https://api.openai.com/v1/responses"
 CARD_TIMEOUT_SECONDS = 20
 CARD_CHARACTER_THRESHOLD = 300
@@ -325,6 +326,7 @@ def card_generation_payload(
     source_text: str,
     last_card: Card | None,
     topic_outline: list[str],
+    model: ai.AIModel = ai.DEFAULT_AI_MODEL,
 ) -> dict[str, Any]:
     context = {
         "new_text": source_text,
@@ -339,7 +341,7 @@ def card_generation_payload(
         "topic_outline": topic_outline,
     }
     return {
-        "model": CARD_MODEL,
+        "model": model.model,
         "reasoning": {"effort": "none"},
         "instructions": CARD_INSTRUCTIONS,
         "input": json.dumps(context, ensure_ascii=False),
@@ -356,11 +358,14 @@ def card_generation_payload(
     }
 
 
-def final_card_generation_payload(transcript: str) -> dict[str, Any]:
+def final_card_generation_payload(
+    transcript: str,
+    model: ai.AIModel = ai.DEFAULT_AI_MODEL,
+) -> dict[str, Any]:
     # ponytail: one full-transcript request; add chapter batching only if model
     # limits are reached in real recordings.
     return {
-        "model": CARD_MODEL,
+        "model": model.model,
         "reasoning": {"effort": "none"},
         "instructions": FINAL_CARD_INSTRUCTIONS,
         "input": transcript,
@@ -377,39 +382,24 @@ def final_card_generation_payload(transcript: str) -> dict[str, Any]:
     }
 
 
-def _response_output_text(response: dict[str, Any]) -> str:
-    if response.get("status") != "completed":
+def _response_output_text(
+    response: dict[str, Any], model: ai.AIModel = ai.DEFAULT_AI_MODEL
+) -> str:
+    if model.provider == ai.OPENAI_PROVIDER and response.get("status") != "completed":
         raise CardGenerationError("図解生成が完了しませんでした。")
-    parts: list[str] = []
-    for item in response.get("output", []):
-        if item.get("type") != "message":
-            continue
-        for content in item.get("content", []):
-            if content.get("type") == "refusal":
-                raise CardGenerationError("図解生成が拒否されました。")
-            if content.get("type") == "output_text":
-                parts.append(str(content.get("text", "")))
-    text = "".join(parts).strip()
-    if not text:
-        raise CardGenerationError("図解生成の応答が空でした。")
-    return text
-
-
-def _request_card_generation(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
-    request = urllib.request.Request(
-        RESPONSES_URL,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(
-            request, timeout=CARD_TIMEOUT_SECONDS
-        ) as response:
-            response_payload = json.loads(response.read())
+        return ai.response_text(response, model)
+    except ValueError as error:
+        raise CardGenerationError(str(error)) from error
+
+
+def _request_card_generation(
+    payload: dict[str, Any],
+    api_key: str,
+    model: ai.AIModel = ai.DEFAULT_AI_MODEL,
+) -> dict[str, Any]:
+    try:
+        return ai.request(payload, api_key, CARD_TIMEOUT_SECONDS, model)
     except urllib.error.HTTPError as error:
         try:
             detail = json.loads(error.read()).get("error", {}).get("message")
@@ -420,7 +410,6 @@ def _request_card_generation(payload: dict[str, Any], api_key: str) -> dict[str,
         raise CardGenerationError(f"図解生成との通信に失敗しました: {error}") from error
     except json.JSONDecodeError as error:
         raise CardGenerationError("図解生成から不正なJSONを受信しました。") from error
-    return response_payload
 
 
 def generate_card(
@@ -428,13 +417,16 @@ def generate_card(
     api_key: str,
     last_card: Card | None,
     topic_outline: list[str],
+    model: ai.AIModel = ai.DEFAULT_AI_MODEL,
 ) -> dict[str, object]:
     payload = _request_card_generation(
-        card_generation_payload(source_text, last_card, topic_outline), api_key
+        card_generation_payload(source_text, last_card, topic_outline, model),
+        api_key,
+        model,
     )
 
     try:
-        result = json.loads(_response_output_text(payload))
+        result = json.loads(_response_output_text(payload, model))
         decision = result["decision"]
         title = str(result["title"]).strip()
         raw_html = str(result["html"])
@@ -458,12 +450,16 @@ def generate_card(
     }
 
 
-def generate_final_cards(transcript: str, api_key: str) -> list[Card]:
+def generate_final_cards(
+    transcript: str,
+    api_key: str,
+    model: ai.AIModel = ai.DEFAULT_AI_MODEL,
+) -> list[Card]:
     payload = _request_card_generation(
-        final_card_generation_payload(transcript), api_key
+        final_card_generation_payload(transcript, model), api_key, model
     )
     try:
-        result = json.loads(_response_output_text(payload))
+        result = json.loads(_response_output_text(payload, model))
         raw_cards = result["cards"]
     except (KeyError, TypeError, json.JSONDecodeError) as error:
         raise CardGenerationError("final図解生成の応答形式が不正です。") from error
@@ -577,9 +573,10 @@ class CardPipeline:
         idle_seconds: float = CARD_IDLE_SECONDS,
         max_seconds: float = CARD_MAX_SECONDS,
         generator: Callable[
-            [str, str, Card | None, list[str]], dict[str, object]
+            [str, str, Card | None, list[str], ai.AIModel], dict[str, object]
         ] = generate_card,
         store: CardStore | None = None,
+        model: ai.AIModel = ai.DEFAULT_AI_MODEL,
     ) -> None:
         self.api_key = api_key
         self.store = store if store is not None else CardStore(output_dir)
@@ -591,6 +588,7 @@ class CardPipeline:
             max_seconds,
         )
         self.generator = generator
+        self.model = model
         self.queue: asyncio.Queue[str | None] = asyncio.Queue()
         self.worker_task: asyncio.Task[None] | None = None
         self.timer_task: asyncio.Task[None] | None = None
@@ -654,6 +652,7 @@ class CardPipeline:
                     self.api_key,
                     self.store.last(),
                     self.store.titles(),
+                    self.model,
                 )
             except Exception as error:
                 last_error = error

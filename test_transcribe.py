@@ -20,6 +20,7 @@ from types import ModuleType, SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import MagicMock, patch
 
+import ai
 from cards import Card, CardGenerationError
 import transcribe
 
@@ -59,6 +60,28 @@ def test_translation_configuration_and_output() -> None:
             ]
         }
     ) == "こんにちは。"
+
+
+def test_deepseek_glossary_uses_json_output() -> None:
+    response = MagicMock()
+    response.__enter__.return_value.read.return_value = json.dumps(
+        {
+            "choices": [
+                {"message": {"content": '{"terms":["OpenAI","OpenAI"]}'}}
+            ]
+        }
+    ).encode()
+    with patch("transcribe.urllib.request.urlopen", return_value=response) as urlopen:
+        result = transcribe.extract_glossary(
+            "OpenAI", "deepseek-key", ai.DEEPSEEK_FLASH_MODEL
+        )
+
+    body = json.loads(urlopen.call_args.args[0].data)
+    assert urlopen.call_args.args[0].full_url == ai.DEEPSEEK_CHAT_COMPLETIONS_URL
+    assert body["model"] == "deepseek-v4-flash"
+    assert body["thinking"] == {"type": "disabled"}
+    assert body["response_format"] == {"type": "json_object"}
+    assert result == ["OpenAI"]
 
 
 def test_transcript_correction_configuration_and_fallback() -> None:
@@ -419,7 +442,7 @@ async def test_periodic_batch_refresh_updates_correction_glossary() -> None:
     received_glossaries: list[list[str]] = []
 
     def capture_glossary(
-        text: str, context: str, terms: list[str], api_key: str
+        text: str, context: str, terms: list[str], api_key: str, model: object
     ) -> str:
         received_glossaries.append(terms)
         return text
@@ -480,7 +503,7 @@ async def test_periodic_batch_refresh_uses_growth_and_tail_windows() -> None:
             patch("transcribe.batch_transcribe", side_effect=transcribe_snapshot),
             patch(
                 "transcribe.extract_glossary",
-                side_effect=lambda text, _: [text],
+                side_effect=lambda text, _, __: [text],
             ),
             patch(
                 "transcribe.write_batch_transcript", return_value=final_path
@@ -603,7 +626,11 @@ async def test_correction_worker_preserves_original_and_order() -> None:
     written: list[str] = []
 
     def correct_in_different_durations(
-        text: str, context: str, glossary: list[str], api_key: str
+        text: str,
+        context: str,
+        glossary: list[str],
+        api_key: str,
+        model: object,
     ) -> str:
         calls.append((text, context))
         time.sleep(0.02 if text == "first" else 0)
@@ -1349,7 +1376,9 @@ async def test_corrected_text_reaches_all_outputs() -> None:
     assert connect_calls[0][1]["additional_headers"] == {
         "xi-api-key": "eleven-key"
     }
-    correct.assert_called_once_with("Original text", "", [], "openai-key")
+    correct.assert_called_once_with(
+        "Original text", "", [], "openai-key", ai.DEFAULT_AI_MODEL
+    )
     translate.assert_called_once_with("Corrected text", "openai-key")
     pipeline = pipeline_instances[0]
     assert pipeline.api_key == "openai-key"

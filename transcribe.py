@@ -30,6 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import ai
 from cards import (
     CARD_CHARACTER_THRESHOLD,
     CARD_IDLE_SECONDS,
@@ -44,7 +45,7 @@ from viewer import ViewerServer, export_cards, final_cards_path
 
 MODEL = "scribe_v2_realtime"
 BATCH_MODEL = "scribe_v2"
-TRANSLATION_MODEL = "gpt-5.6-luna"
+TRANSLATION_MODEL = ai.DEFAULT_AI_MODEL.model
 WEBSOCKET_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
 BATCH_TRANSCRIPTION_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 RESPONSES_URL = "https://api.openai.com/v1/responses"
@@ -353,29 +354,27 @@ def correction_payload(text: str, context: str, glossary: list[str]) -> dict[str
 
 
 def request_response_text(
-    payload: dict[str, Any], api_key: str, timeout: float
+    payload: dict[str, Any],
+    api_key: str,
+    timeout: float,
+    model: ai.AIModel = ai.DEFAULT_AI_MODEL,
 ) -> str:
-    request = urllib.request.Request(
-        RESPONSES_URL,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response_output_text(json.loads(response.read()))
+    return response_output_text(ai.request(payload, api_key, timeout, model), model)
 
 
 def correct_transcript(
-    text: str, context: str, glossary: list[str], api_key: str
+    text: str,
+    context: str,
+    glossary: list[str],
+    api_key: str,
+    model: ai.AIModel = ai.DEFAULT_AI_MODEL,
 ) -> str:
     try:
         return request_response_text(
             correction_payload(text, context, glossary),
             api_key,
             CORRECTION_TIMEOUT_SECONDS,
+            model,
         )
     except Exception as error:
         print(f"[補正] 警告: {error}", file=sys.stderr, flush=True)
@@ -414,10 +413,14 @@ def glossary_payload(text: str) -> dict[str, Any]:
     }
 
 
-def extract_glossary(text: str, api_key: str) -> list[str]:
+def extract_glossary(
+    text: str,
+    api_key: str,
+    model: ai.AIModel = ai.DEFAULT_AI_MODEL,
+) -> list[str]:
     value = json.loads(
         request_response_text(
-            glossary_payload(text), api_key, CORRECTION_TIMEOUT_SECONDS
+            glossary_payload(text), api_key, CORRECTION_TIMEOUT_SECONDS, model
         )
     )
     terms = value.get("terms") if isinstance(value, dict) else None
@@ -586,6 +589,7 @@ async def periodically_refresh_final(
     interval_seconds: float = BATCH_REFRESH_SECONDS,
     glossary: list[str] | None = None,
     openai_api_key: str = "",
+    model: ai.AIModel = ai.DEFAULT_AI_MODEL,
 ) -> None:
     loop = asyncio.get_running_loop()
     next_refresh = loop.time() + interval_seconds
@@ -623,7 +627,7 @@ async def periodically_refresh_final(
                 if glossary is not None:
                     try:
                         updated = await asyncio.to_thread(
-                            extract_glossary, text, openai_api_key
+                            extract_glossary, text, openai_api_key, model
                         )
                     except Exception as error:
                         print(
@@ -667,24 +671,26 @@ def finalize_recording(
     return output_path, text
 
 
-def response_output_text(response: dict[str, Any]) -> str:
-    parts: list[str] = []
-    for item in response.get("output", []):
-        if item.get("type") != "message":
-            continue
-        for content in item.get("content", []):
-            if content.get("type") == "output_text":
-                parts.append(str(content.get("text", "")))
-    text = "".join(parts).strip()
-    if not text:
-        raise TranslationError("日本語訳が空でした。")
-    return text
+def response_output_text(
+    response: dict[str, Any], model: ai.AIModel = ai.DEFAULT_AI_MODEL
+) -> str:
+    try:
+        return ai.response_text(response, model)
+    except ValueError as error:
+        raise TranslationError(str(error)) from error
 
 
-def translate_to_japanese(text: str, api_key: str) -> str:
+def translate_to_japanese(
+    text: str,
+    api_key: str,
+    model: ai.AIModel = ai.DEFAULT_AI_MODEL,
+) -> str:
     try:
         return request_response_text(
-            translation_payload(text), api_key, TRANSLATION_TIMEOUT_SECONDS
+            translation_payload(text),
+            api_key,
+            TRANSLATION_TIMEOUT_SECONDS,
+            model,
         )
     except urllib.error.HTTPError as error:
         try:
@@ -826,6 +832,7 @@ async def process_corrections(
     glossary: list[str],
     api_key: str,
     finalize_text: Callable[[str], Awaitable[None]],
+    model: ai.AIModel = ai.DEFAULT_AI_MODEL,
 ) -> None:
     context = ""
     while True:
@@ -834,7 +841,12 @@ async def process_corrections(
             if text is None:
                 return
             corrected = await asyncio.to_thread(
-                correct_transcript, text, context, glossary.copy(), api_key
+                correct_transcript,
+                text,
+                context,
+                glossary.copy(),
+                api_key,
+                model,
             )
             await finalize_text(corrected)
             context = "\n".join(filter(None, (context, corrected)))[-500:]

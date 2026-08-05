@@ -42,18 +42,22 @@ def model_from_values(provider: str, model: str) -> AIModel:
 
 
 def available_models(deepseek_key: str) -> list[AIModel]:
-    return [
-        DEFAULT_AI_MODEL,
-        *( [DEEPSEEK_FLASH_MODEL] if deepseek_key else []),
-    ]
+    models = [DEFAULT_AI_MODEL]
+    if deepseek_key:
+        models.append(DEEPSEEK_FLASH_MODEL)
+    return models
 
 
 def api_key_for(model: AIModel, openai_key: str, deepseek_key: str) -> str:
     if model.provider == OPENAI_PROVIDER:
-        return openai_key
-    if model.provider == DEEPSEEK_PROVIDER:
-        return deepseek_key
-    raise ValueError("利用できないAIプロバイダです。")
+        key = openai_key
+    elif model.provider == DEEPSEEK_PROVIDER:
+        key = deepseek_key
+    else:
+        raise ValueError("利用できないAIプロバイダです。")
+    if not key:
+        raise ValueError("選択したAIモデルのAPIキーが設定されていません。")
+    return key
 
 
 def request(
@@ -110,6 +114,8 @@ def response_text(response: dict[str, Any], model: AIModel = DEFAULT_AI_MODEL) -
             if item.get("type") != "message":
                 continue
             for content in item.get("content", []):
+                if content.get("type") == "refusal":
+                    raise ValueError("AI応答が拒否されました。")
                 if content.get("type") == "output_text":
                     parts.append(str(content.get("text", "")))
         text = "".join(parts).strip()

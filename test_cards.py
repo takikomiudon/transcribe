@@ -6,8 +6,9 @@ import asyncio
 import json
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import ai
 import cards
 
 
@@ -128,6 +129,38 @@ def test_generate_card_parses_and_sanitizes_response() -> None:
         "html": '<div class="callout"><p>Safe</p></div>',
         "total_tokens": 123,
     }
+
+
+def test_deepseek_card_generation_uses_json_output() -> None:
+    response = MagicMock()
+    response.__enter__.return_value.read.return_value = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {"decision": "skip", "title": "", "html": ""}
+                        )
+                    }
+                }
+            ]
+        }
+    ).encode()
+    with patch("cards.urllib.request.urlopen", return_value=response) as urlopen:
+        result = cards.generate_card(
+            "source",
+            "deepseek-key",
+            None,
+            [],
+            ai.DEEPSEEK_FLASH_MODEL,
+        )
+
+    body = json.loads(urlopen.call_args.args[0].data)
+    assert urlopen.call_args.args[0].full_url == ai.DEEPSEEK_CHAT_COMPLETIONS_URL
+    assert body["model"] == "deepseek-v4-flash"
+    assert body["thinking"] == {"type": "disabled"}
+    assert body["response_format"] == {"type": "json_object"}
+    assert result["decision"] == "skip"
 
 
 def test_final_card_generation_payload() -> None:
@@ -282,6 +315,7 @@ async def test_card_pipeline_applies_decisions_in_order() -> None:
         _: str,
         last_card: cards.Card | None,
         titles: list[str],
+        __: object,
     ) -> dict[str, object]:
         contexts.append((source_text, last_card, titles))
         return generated.pop(0)
