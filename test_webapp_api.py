@@ -100,6 +100,13 @@ def test_index_includes_accessible_model_selector() -> None:
         assert "AIモデル" in html
 
 
+def test_static_app_does_not_reconnect_after_server_shutdown() -> None:
+    with api_client() as (client, _):
+        script = client.get("/static/app.js").text
+        assert "event.code === 1012" in script
+        assert "event.code === 1001" in script
+
+
 def test_model_can_be_selected_before_recording_only() -> None:
     with api_client("deepseek-key") as (client, _):
         session = client.post("/api/sessions").json()
