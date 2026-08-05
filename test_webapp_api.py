@@ -81,6 +81,7 @@ def test_config_lists_only_configured_models() -> None:
             "model": "gpt-5.6-luna",
             "label": "GPT-5.6 Luna",
         }
+        assert payload["deepseek_peak_hours_utc"] == [[1, 4], [6, 10]]
         assert [model["model"] for model in payload["models"]] == [
             "gpt-5.6-luna"
         ]

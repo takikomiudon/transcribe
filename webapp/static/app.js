@@ -3,6 +3,9 @@
 const state = {
   sessions: [],
   models: [],
+  defaultModel: {provider: "openai", model: "gpt-5.6-luna", label: "GPT-5.6 Luna"},
+  deepseekPeakHoursUtc: [],
+  deepseekPeak: false,
   currentId: null,
   status: {active_session_id: null, state: "idle"},
   ws: null,
@@ -171,6 +174,9 @@ async function initialize() {
     state.sessions = sortSessions(sessionsPayload.sessions);
     state.status = statusPayload;
     state.models = configPayload.models;
+    state.defaultModel = configPayload.default_model;
+    state.deepseekPeakHoursUtc = configPayload.deepseek_peak_hours_utc;
+    state.deepseekPeak = isDeepSeekPeakTime();
     renderSidebar();
     if (state.sessions.length) await selectSession(state.sessions[0].id);
     else await createSession();
@@ -652,6 +658,10 @@ async function changeModel() {
   const session = currentDetail?.session;
   const model = state.models.find(item => modelKey(item) === elements.modelSelect.value);
   if (!session || session.has_audio || !model) return;
+  if (isDeepSeekPeakTime() && session.ai_provider === "deepseek") {
+    renderHeader();
+    return;
+  }
   try {
     const updated = await request(`/api/sessions/${encodeURIComponent(session.id)}/model`, {
       method: "PATCH",
@@ -792,6 +802,11 @@ function modelKey(model) {
   return `${model.provider}:${model.model}`;
 }
 
+function isDeepSeekPeakTime() {
+  const hour = new Date().getUTCHours();
+  return state.deepseekPeakHoursUtc.some(([start, end]) => start <= hour && hour < end);
+}
+
 function renderModelSelector(session, recording, finalizing) {
   const select = elements.modelSelect;
   if (select.options.length !== state.models.length) {
@@ -806,9 +821,10 @@ function renderModelSelector(session, recording, finalizing) {
     select.disabled = true;
     return;
   }
-  const value = modelKey(session);
+  const forcedToLuna = session.ai_provider === "deepseek" && isDeepSeekPeakTime();
+  const value = modelKey(forcedToLuna ? state.defaultModel : session);
   if ([...select.options].some(option => option.value === value)) select.value = value;
-  select.disabled = session.has_audio || recording || finalizing || startRequested;
+  select.disabled = session.has_audio || recording || finalizing || startRequested || forcedToLuna;
 }
 
 function renderAudio() {
@@ -1082,3 +1098,9 @@ function setSidebarOpen(open) {
 }
 
 initialize();
+setInterval(() => {
+  const peak = isDeepSeekPeakTime();
+  if (peak === state.deepseekPeak) return;
+  state.deepseekPeak = peak;
+  renderHeader();
+}, 30_000);

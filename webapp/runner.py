@@ -89,9 +89,9 @@ class SessionRunner:
         self.title_fn = title_fn
         self.elevenlabs_key = elevenlabs_key
         self.ai_model = ai.model_from_values(session.ai_provider, session.ai_model)
-        self.ai_key = ai.api_key_for(
-            self.ai_model, openai_key, deepseek_key
-        )
+        self.openai_key = openai_key
+        self.deepseek_key = deepseek_key
+        self._ai_credentials()
         self.curl_path = curl_path
         self.refresh_interval = refresh_interval
         self.registry = registry
@@ -124,6 +124,28 @@ class SessionRunner:
         self._stopped = False
         self._accepting_audio = False
         self._last_cards: list[dict[str, Any]] = []
+
+    def _ai_credentials(self) -> tuple[str, ai.AIModel]:
+        model = ai.effective_model(self.ai_model)
+        key = ai.api_key_for(model, self.openai_key, self.deepseek_key)
+        return key, model
+
+    def _generate_card(
+        self,
+        source_text: str,
+        _: str,
+        previous: cards.Card | None,
+        glossary: list[str],
+        __: ai.AIModel,
+    ) -> dict[str, object]:
+        key, model = self._ai_credentials()
+        return self.card_generator(source_text, key, previous, glossary, model)
+
+    def _extract_glossary(
+        self, text: str, _: str, __: ai.AIModel
+    ) -> list[str]:
+        key, model = self._ai_credentials()
+        return self.glossary_fn(text, key, model)
 
     async def start(self) -> None:
         if self._started:
@@ -158,11 +180,12 @@ class SessionRunner:
             card_store = cards.CardStore.attach(
                 self._path("cards"), self._path("cards_html")
             )
+            key, model = self._ai_credentials()
             self.pipeline = cards.CardPipeline(
-                self.ai_key,
+                key,
                 store=card_store,
-                generator=self.card_generator,
-                model=self.ai_model,
+                generator=self._generate_card,
+                model=model,
             )
             self.pipeline.start()
             self._last_cards = _card_values(card_store.snapshot())
@@ -296,11 +319,12 @@ class SessionRunner:
 
             if text is not None:
                 try:
+                    key, model = self._ai_credentials()
                     final_cards = await asyncio.to_thread(
                         self.final_card_generator,
                         text,
-                        self.ai_key,
-                        self.ai_model,
+                        key,
+                        model,
                     )
                     cards.save_cards(final_cards, self._path("final_cards"))
                     await self._emit(
@@ -339,11 +363,12 @@ class SessionRunner:
                         title_text = text or _transcript_body(
                             self._path("transcript")
                         ) or ""
+                        key, model = self._ai_credentials()
                         title = await asyncio.to_thread(
                             self.title_fn,
                             title_text,
-                            self.ai_key,
-                            self.ai_model,
+                            key,
+                            model,
                         )
                         if title and title.strip():
                             self.session.title = title.strip()
@@ -432,13 +457,14 @@ class SessionRunner:
                     return
                 seq, text = item
                 try:
+                    key, model = self._ai_credentials()
                     corrected = await asyncio.to_thread(
                         self.correct_fn,
                         text,
                         context,
                         list(self.glossary),
-                        self.ai_key,
-                        self.ai_model,
+                        key,
+                        model,
                     )
                 except (
                     transcribe.TranslationError,
@@ -517,8 +543,9 @@ class SessionRunner:
         original_batch = transcribe.batch_transcribe
         original_glossary = transcribe.extract_glossary
         transcribe.batch_transcribe = self.batch_fn
-        transcribe.extract_glossary = self.glossary_fn
+        transcribe.extract_glossary = self._extract_glossary
         try:
+            key, model = self._ai_credentials()
             await transcribe.periodically_refresh_final(
                 self._path("transcript"),
                 self._path("audio"),
@@ -529,8 +556,8 @@ class SessionRunner:
                 self.refresh_stop,
                 interval_seconds=self.refresh_interval,
                 glossary=self.glossary,
-                openai_api_key=self.ai_key,
-                model=self.ai_model,
+                openai_api_key=key,
+                model=model,
             )
         finally:
             transcribe.batch_transcribe = original_batch

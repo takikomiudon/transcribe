@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import ai
@@ -37,6 +38,29 @@ def test_deepseek_is_available_only_with_a_key() -> None:
         "gpt-5.6-luna",
         "deepseek-v4-flash",
     ]
+
+
+def test_deepseek_peak_hours_use_utc_half_open_boundaries() -> None:
+    def at(hour: int, minute: int = 0) -> datetime:
+        return datetime(2026, 8, 5, hour, minute, tzinfo=timezone.utc)
+
+    assert not ai.is_deepseek_peak_hour(at(0, 59))
+    assert ai.is_deepseek_peak_hour(at(1, 0))
+    assert ai.is_deepseek_peak_hour(at(3, 59))
+    assert not ai.is_deepseek_peak_hour(at(4, 0))
+    assert not ai.is_deepseek_peak_hour(at(5, 59))
+    assert ai.is_deepseek_peak_hour(at(6, 0))
+    assert ai.is_deepseek_peak_hour(at(9, 59))
+    assert not ai.is_deepseek_peak_hour(at(10, 0))
+
+
+def test_effective_model_only_replaces_deepseek_during_peak_hours() -> None:
+    peak = datetime(2026, 8, 5, 1, 0, tzinfo=timezone.utc)
+    regular = datetime(2026, 8, 5, 4, 0, tzinfo=timezone.utc)
+
+    assert ai.effective_model(ai.DEEPSEEK_FLASH_MODEL, peak) == ai.DEFAULT_AI_MODEL
+    assert ai.effective_model(ai.DEEPSEEK_FLASH_MODEL, regular) == ai.DEEPSEEK_FLASH_MODEL
+    assert ai.effective_model(ai.DEFAULT_AI_MODEL, peak) == ai.DEFAULT_AI_MODEL
 
 
 def test_deepseek_request_uses_chat_completions_and_json_output() -> None:

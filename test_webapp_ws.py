@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+import ai
 import cards
 import transcribe
 from webapp.app import app
@@ -124,6 +125,35 @@ def make_runner(
         registry=registry,
         broadcast=broadcast,
     )
+
+
+def test_deepseek_runner_resolves_current_model_and_key() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        ensure_dirs(root)
+        store = SessionStore(root)
+        session = store.create()
+        session.ai_provider = ai.DEEPSEEK_FLASH_MODEL.provider
+        session.ai_model = ai.DEEPSEEK_FLASH_MODEL.model
+        store.save(session)
+        runner = SessionRunner(
+            session,
+            store,
+            root,
+            openai_key="openai-key",
+            deepseek_key="deepseek-key",
+        )
+
+        with patch("ai.is_deepseek_peak_hour", return_value=True):
+            assert runner._ai_credentials() == (
+                "openai-key",
+                ai.DEFAULT_AI_MODEL,
+            )
+        with patch("ai.is_deepseek_peak_hour", return_value=False):
+            assert runner._ai_credentials() == (
+                "deepseek-key",
+                ai.DEEPSEEK_FLASH_MODEL,
+            )
 
 
 async def test_runner_streams_corrects_and_finalizes() -> None:

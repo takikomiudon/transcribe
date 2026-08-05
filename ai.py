@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -32,6 +33,18 @@ DEEPSEEK_FLASH_MODEL = AIModel(
     label="DeepSeek V4 Flash",
 )
 MODEL_PRESETS = (DEFAULT_AI_MODEL, DEEPSEEK_FLASH_MODEL)
+DEEPSEEK_PEAK_HOURS_UTC = ((1, 4), (6, 10))
+
+
+def is_deepseek_peak_hour(now: datetime | None = None) -> bool:
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return any(start <= current.hour < end for start, end in DEEPSEEK_PEAK_HOURS_UTC)
+
+
+def effective_model(model: AIModel, now: datetime | None = None) -> AIModel:
+    if model.provider == DEEPSEEK_PROVIDER and is_deepseek_peak_hour(now):
+        return DEFAULT_AI_MODEL
+    return model
 
 
 def model_from_values(provider: str, model: str) -> AIModel:

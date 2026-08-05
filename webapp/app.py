@@ -110,6 +110,7 @@ def api_config(request: Request) -> dict[str, Any]:
     return {
         "default_model": asdict(ai.DEFAULT_AI_MODEL),
         "models": [asdict(model) for model in models],
+        "deepseek_peak_hours_utc": list(ai.DEEPSEEK_PEAK_HOURS_UTC),
     }
 
 

@@ -148,6 +148,7 @@ async def _start(websocket: WebSocket, id: str, command: dict[str, Any]) -> None
 
     try:
         model = ai.model_from_values(session.ai_provider, session.ai_model)
+        model = ai.effective_model(model)
         ai.api_key_for(model, state.openai_key, state.deepseek_key)
     except ValueError as error:
         await _send_error(websocket, str(error))
