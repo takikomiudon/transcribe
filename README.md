@@ -70,6 +70,23 @@ uv run transcribe.py --device 0 --cards
 
 初回起動時にmacOSから求められたら、ターミナルのマイク利用を許可してください。拒否した場合は「システム設定 → プライバシーとセキュリティ → マイク」から変更できます。
 
+## Webアプリ
+
+初回は `uv sync` でWebアプリ用の依存を導入し、次のコマンドで起動します。
+
+```sh
+uv sync
+uv run -m webapp
+```
+
+ブラウザで <http://127.0.0.1:8770> を開いてください。ブラウザの `getUserMedia` でマイク音声を取得し、16kHz PCMへ変換してWebSocketでサーバーへストリーミングします。利用にはブラウザのマイク許可が必要です。localhostはsecure contextとして扱われるため、ローカル利用ではHTTPSは不要です。
+
+Webアプリではセッション履歴を残し、録音の開始・停止・同じセッションへの再開ができます。録音したWAVは最終処理後も常に保持し、削除する場合はセッションメニューから明示的に操作します。
+
+CLIはWebアプリから独立しており、従来どおり `uv run transcribe.py` で利用できます。CLIはstdlibとwebsocketsだけを使う方針を維持します。WebアプリはFastAPIとuvicornを使用し、依存は `pyproject.toml` で管理します。
+
+録音中セッションの管理は単一プロセス内で行います。`uvicorn --workers` の指定や、同じデータディレクトリを使う複数インスタンスの同時起動には対応していません。
+
 ## AudibleなどのMac音声
 
 システム音声を入力として扱うには、BlackHoleを別途インストールし、「Audio MIDI設定」で通常の出力先とBlackHoleを含む複数出力装置を作成します。その後、`--list-devices` に表示されるBlackHoleの番号を指定します。

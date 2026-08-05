@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self' ws: wss:; worker-src 'self'; media-src 'self' blob:">
+  <title>Transcribe</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <button id="sidebar-overlay" class="sidebar-overlay" type="button" aria-label="サイドバーを閉じる" tabindex="-1"></button>
+    <aside id="sidebar" class="sidebar" aria-label="セッション履歴">
+      <div class="brand-row">
+        <span class="brand-mark" aria-hidden="true">T</span>
+        <span class="brand-name">Transcribe</span>
+        <button id="sidebar-close" class="icon-button sidebar-close" type="button" aria-label="サイドバーを閉じる">×</button>
+      </div>
+      <button id="new-session" class="new-session-button" type="button">
+        <span aria-hidden="true">＋</span>
+        新しいセッション
+      </button>
+      <nav id="session-list" class="session-list" aria-label="セッション一覧">
+        <p class="sidebar-empty">履歴を読み込んでいます。</p>
+      </nav>
+    </aside>
+
+    <main class="main-pane">
+      <header class="main-header">
+        <button id="menu-button" class="icon-button menu-button" type="button" aria-label="セッション一覧を開く" aria-controls="sidebar" aria-expanded="false">
+          <span aria-hidden="true">☰</span>
+        </button>
+        <div class="session-heading">
+          <div class="title-line">
+            <h1 class="session-title-heading">
+              <button id="session-title-button" class="session-title-button" type="button" title="名前を変更" disabled>
+                <span id="session-title">セッションを選択</span>
+                <span class="edit-icon" aria-hidden="true">✎</span>
+              </button>
+              <input id="session-title-input" class="session-title-input" type="text" aria-label="セッション名" autocomplete="off" hidden>
+            </h1>
+            <span id="status-badge" class="status-badge stopped">停止</span>
+          </div>
+          <p id="session-meta" class="session-meta">履歴からセッションを選んでください。</p>
+        </div>
+        <button id="record-button" class="record-button" type="button" disabled>録音開始</button>
+      </header>
+
+      <div id="toast" class="toast" role="alert" aria-live="assertive" hidden></div>
+
+      <div class="content-shell">
+        <div id="level-row" class="level-row" hidden>
+          <span class="level-label">入力レベル</span>
+          <div class="level-track" role="meter" aria-label="マイク入力レベル" aria-valuemin="0" aria-valuemax="1" aria-valuenow="0">
+            <span id="level-fill" class="level-fill"></span>
+          </div>
+        </div>
+
+        <audio id="audio-player" class="audio-player" controls preload="metadata" hidden></audio>
+
+        <div class="workspace">
+          <section class="transcript-panel panel" aria-labelledby="transcript-heading">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Transcript</p>
+                <h2 id="transcript-heading">文字起こし</h2>
+              </div>
+              <div class="transcript-toggle" role="group" aria-label="文字起こし表示">
+                <button id="live-transcript-button" class="toggle-button active" type="button" aria-pressed="true">ライブ</button>
+                <button id="final-transcript-button" class="toggle-button" type="button" aria-pressed="false" disabled>高精度版</button>
+              </div>
+            </div>
+            <div id="transcript-scroll" class="transcript-scroll" aria-live="polite">
+              <div id="transcript-content" class="transcript-content">
+                <p class="empty">セッションを選択してください。</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="cards-panel panel" aria-labelledby="cards-heading">
+            <div class="panel-header cards-header">
+              <div>
+                <p class="eyebrow">Visual notes</p>
+                <h2 id="cards-heading">図解カード</h2>
+              </div>
+              <div class="card-tabs" role="tablist" aria-label="カードの種類">
+                <button id="live-cards-tab" class="card-tab" type="button" role="tab" data-view="live" aria-selected="true" aria-controls="cards" tabindex="0">速報版</button>
+                <button id="final-cards-tab" class="card-tab" type="button" role="tab" data-view="final" aria-selected="false" aria-controls="cards" aria-disabled="true" tabindex="-1" disabled>品質版</button>
+              </div>
+            </div>
+            <p id="cards-status" class="card-status" role="status" aria-live="polite">速報版を表示しています。</p>
+            <div id="cards" class="cards" role="tabpanel" aria-labelledby="live-cards-tab" aria-live="polite">
+              <p class="empty">カードを待っています。</p>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

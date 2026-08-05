@@ -525,6 +525,23 @@ class CardStore:
         self.cards: list[Card] = []
         self._persist()
 
+    @classmethod
+    def attach(cls, json_path: Path, html_path: Path) -> "CardStore":
+        store = cls.__new__(cls)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        html_path.parent.mkdir(parents=True, exist_ok=True)
+        store.json_path = json_path
+        store.html_path = html_path
+        if json_path.exists():
+            store.cards = [
+                Card(**value)
+                for value in json.loads(json_path.read_text(encoding="utf-8"))
+            ]
+        else:
+            store.cards = []
+            store._persist()
+        return store
+
     def snapshot(self) -> list[Card]:
         return list(self.cards)
 
@@ -562,9 +579,10 @@ class CardPipeline:
         generator: Callable[
             [str, str, Card | None, list[str]], dict[str, object]
         ] = generate_card,
+        store: CardStore | None = None,
     ) -> None:
         self.api_key = api_key
-        self.store = CardStore(output_dir)
+        self.store = store if store is not None else CardStore(output_dir)
         self.json_path = self.store.json_path
         self.html_path = self.store.html_path
         self.buffer = TextBuffer(

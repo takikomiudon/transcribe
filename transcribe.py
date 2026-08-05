@@ -765,6 +765,8 @@ async def receive_events(
     reducer: TranscriptReducer,
     progress_changed: asyncio.Event,
     finalize_text: Callable[[str], Awaitable[None]] | None = None,
+    *,
+    on_partial: Callable[[str], None] | None = None,
 ) -> None:
     error_types = {
         "error",
@@ -796,6 +798,8 @@ async def receive_events(
             raise RealtimeAPIError(str(error or "Realtime APIでエラーが発生しました。"))
 
         _, completed = reducer.handle(event)
+        if on_partial is not None:
+            on_partial(reducer.partial)
         for ready_text in reducer.take_ready():
             if finalize_text is not None:
                 await finalize_text(ready_text)

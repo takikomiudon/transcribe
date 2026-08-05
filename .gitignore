@@ -7,3 +7,5 @@ __pycache__/
 transcripts/
 recordings/
 cards_output/
+sessions/
+.claude/settings.local.json
