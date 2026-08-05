@@ -66,42 +66,95 @@ ALLOWED_CLASSES = {
 BLOCKED_CONTENT_TAGS = {"iframe", "math", "object", "script", "style", "svg"}
 
 CARD_INSTRUCTIONS = """\
-You turn live lecture transcripts into compact Japanese diagram cards.
-Use the new text, the last card, and the topic outline to choose exactly one:
-- new_card: a new topic deserves its own card.
-- update_last: the new text completes or corrects only the latest card.
-- skip: the text is chatter, repetition, or too insubstantial to diagram.
+あなたは講義のライブ文字起こしを、コンパクトな日本語の図解カードに変換します。
+新しいテキスト・直前のカード・トピック概要を踏まえ、必ず次のいずれか1つを選びます:
+- new_card: 新しい話題であり、独立したカードに値する。
+- update_last: 新しいテキストが直前のカードの補完・修正にとどまる。
+- skip: 雑談・繰り返し・図解に値しない断片である。
+直前のカードと同じ話題が続いている場合は new_card より update_last を優先します。
+1〜2文の言い換えにしかならないカードや、既存カードとほぼ重複するカードを
+作るくらいなら skip を優先します。
 
-For new_card and update_last, return a concise title and only the card's inner
-HTML. Use one of these component roots: flow, compare, tree, timeline,
-keyvalue, or callout. Allowed tags are div, span, p, ul, ol, li, table, thead,
-tbody, tr, th, td, h3, h4, strong, and em. Allowed classes are card-body,
-flow, flow-step, flow-arrow, compare, compare-item, tree, tree-branch,
-timeline, timeline-item, keyvalue, keyvalue-item, key, value, callout, label,
-accent, and muted. Never output html, style, script, inline style, event
-handlers, URLs, images, or any other tags/classes. Keep each card to a heading
-and 3-7 elements with no internal scrolling. Naturally correct obvious
-transcription errors without adding unsupported facts. For skip, return empty
-title and html strings.
+HTMLを書く前に、まず内容の論理構造を特定し、それに合致するコンポーネント
+ルートを1つだけ選びます。安易に flow を既定にしてはいけません。
+- flow: 真の系列のみ — 順序そのものに意味がある3段階以上の手順・段階・
+  因果連鎖。判定基準: 箱を並べ替えても意味が変わらないなら flow は誤りです。
+- compare: 2つ以上の選択肢・対比・ビフォーアフター・長所短所・対立する
+  アプローチ。1つの側につき compare-item を1つ使います。
+- tree: 1つの概念が種類・原因・要因・論点に枝分かれするもの
+  (分類や分解で、順序を持たないもの)。
+- timeline: 日付・時代・明示的な時系列に紐づく出来事。
+- keyvalue: 名前付きの事実や数値 — 指標・定義・用語と意味の対。
+  具体的な数値が主役の内容では常に keyvalue を優先します。
+- table: 複数の対象を2つ以上の共通属性で比較するもの。
+- callout: 単一の主張・洞察・結論とその補足。1つの考えだけの内容に
+  適しています — 1つの考えを flow に水増ししてはいけません。
+
+記述ルール:
+- 1つの文を複数の flow-step に分割してはいけません。各ステップは独立した
+  段階を自分の言葉で記述します。
+- flow-step・compare-item・tree-branch の内部では、太字の見出しと説明文を
+  別々の要素(strong の後に p または span)に分け、1行に連結しません。
+- 文字起こし中の具体的な数値・金額・割合・固有名詞は、カードにそのまま
+  残します。これらは最も価値の高い情報です。省略・丸め・捏造は禁止です。
+- 1カードにつき主コンポーネントは1つ。結論や注意点のための callout を
+  最大1つまで追加できます。同種のコンポーネントを2つ重ねてはいけません。
+
+new_card と update_last では、簡潔なタイトルとカードの内側のHTMLのみを
+返します。使用可能なタグは div, span, p, ul, ol, li, table, thead, tbody,
+tr, th, td, h3, h4, strong, em です。使用可能なクラスは card-body, flow,
+flow-step, flow-arrow, compare, compare-item, tree, tree-branch, timeline,
+timeline-item, keyvalue, keyvalue-item, key, value, callout, label, accent,
+muted です。html, style, script, インラインスタイル, イベントハンドラ,
+URL, 画像, その他のタグやクラスは決して出力しません。各カードは見出しと
+3〜7個の要素に収め、内部スクロールを発生させません。明らかな文字起こし
+ミスは根拠のない事実を加えない範囲で自然に修正しますが、確信のない
+固有名詞を推測で「修正」してはいけません — 推測するくらいなら文字起こしの
+表記をそのまま残します。skip の場合はタイトルとHTMLを空文字列で返します。
 """
 
 FINAL_CARD_INSTRUCTIONS = """\
-You turn a complete final lecture transcript into compact Japanese diagram
-cards. Read the whole transcript first, then split it into meaningful topics.
-Return the cards in transcript order. Skip chatter, repetition, and content too
-insubstantial to diagram. For each card, copy the relevant final transcript
-passage into source_text.
+あなたは講義の完全な最終文字起こしを、コンパクトな日本語の図解カードに
+変換します。まず文字起こし全体を読み、意味のある話題単位に分割します。
+話者が見出しやセクション名を読み上げている場合は、それを話題の区切りの
+手がかりとして使います。カードは文字起こしの出現順に返します。雑談・
+繰り返し・図解に値しない内容はスキップします。各カードには、対応する
+最終文字起こしの該当箇所を source_text にそのまま写します。
 
-Return a concise title and only the card's inner HTML. Use one of these
-component roots: flow, compare, tree, timeline, keyvalue, or callout. Allowed
-tags are div, span, p, ul, ol, li, table, thead, tbody, tr, th, td, h3, h4,
-strong, and em. Allowed classes are card-body, flow, flow-step, flow-arrow,
-compare, compare-item, tree, tree-branch, timeline, timeline-item, keyvalue,
-keyvalue-item, key, value, callout, label, accent, and muted. Never output html,
-style, script, inline style, event handlers, URLs, images, or any other
-tags/classes. Keep each card to a heading and 3-7 elements with no internal
-scrolling. Naturally correct obvious transcription errors without adding
-unsupported facts.
+HTMLを書く前に、まず内容の論理構造を特定し、それに合致するコンポーネント
+ルートを1つだけ選びます。安易に flow を既定にしてはいけません。
+- flow: 真の系列のみ — 順序そのものに意味がある3段階以上の手順・段階・
+  因果連鎖。判定基準: 箱を並べ替えても意味が変わらないなら flow は誤りです。
+- compare: 2つ以上の選択肢・対比・ビフォーアフター・長所短所・対立する
+  アプローチ。1つの側につき compare-item を1つ使います。
+- tree: 1つの概念が種類・原因・要因・論点に枝分かれするもの
+  (分類や分解で、順序を持たないもの)。
+- timeline: 日付・時代・明示的な時系列に紐づく出来事。
+- keyvalue: 名前付きの事実や数値 — 指標・定義・用語と意味の対。
+  具体的な数値が主役の内容では常に keyvalue を優先します。
+- table: 複数の対象を2つ以上の共通属性で比較するもの。
+- callout: 単一の主張・洞察・結論とその補足。1つの考えだけの内容に
+  適しています — 1つの考えを flow に水増ししてはいけません。
+
+記述ルール:
+- 1つの文を複数の flow-step に分割してはいけません。各ステップは独立した
+  段階を自分の言葉で記述します。
+- flow-step・compare-item・tree-branch の内部では、太字の見出しと説明文を
+  別々の要素(strong の後に p または span)に分け、1行に連結しません。
+- 文字起こし中の具体的な数値・金額・割合・固有名詞は、カードにそのまま
+  残します。これらは最も価値の高い情報です。省略・丸め・捏造は禁止です。
+- 1カードにつき主コンポーネントは1つ。結論や注意点のための callout を
+  最大1つまで追加できます。同種のコンポーネントを2つ重ねてはいけません。
+
+簡潔なタイトルとカードの内側のHTMLのみを返します。使用可能なタグは div,
+span, p, ul, ol, li, table, thead, tbody, tr, th, td, h3, h4, strong, em
+です。使用可能なクラスは card-body, flow, flow-step, flow-arrow, compare,
+compare-item, tree, tree-branch, timeline, timeline-item, keyvalue,
+keyvalue-item, key, value, callout, label, accent, muted です。html, style,
+script, インラインスタイル, イベントハンドラ, URL, 画像, その他のタグや
+クラスは決して出力しません。各カードは見出しと3〜7個の要素に収め、内部
+スクロールを発生させません。明らかな文字起こしミスは根拠のない事実を
+加えない範囲で自然に修正します。
 """
 
 CARD_SCHEMA = {
