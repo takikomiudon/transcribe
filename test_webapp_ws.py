@@ -59,7 +59,9 @@ class FakeElevenLabsWS:
         self.incoming.put_nowait(None)
 
 
-def fake_correct(text: str, _: str, __: list[str], ___: str) -> str:
+def fake_correct(
+    text: str, _: str, __: list[str], ___: str, ____: object
+) -> str:
     return f"補正:{text}"
 
 
@@ -67,7 +69,9 @@ def fake_card_generator(*_: object) -> dict[str, object]:
     return {"decision": "skip", "title": "", "html": ""}
 
 
-def fake_final_card_generator(_: str, __: str) -> list[cards.Card]:
+def fake_final_card_generator(
+    _: str, __: str, ___: object
+) -> list[cards.Card]:
     return [
         cards.Card(
             id="final-card",
@@ -111,9 +115,10 @@ def make_runner(
         glossary_fn=lambda *_: [],
         card_generator=fake_card_generator,
         final_card_generator=fake_final_card_generator,
-        title_fn=lambda _text, _key: "Final title",
+        title_fn=lambda _text, _key, _model: "Final title",
         elevenlabs_key="eleven-key",
         openai_key="openai-key",
+        deepseek_key="deepseek-key",
         curl_path="/usr/bin/curl",
         refresh_interval=3_600,
         registry=registry,
@@ -292,7 +297,7 @@ async def test_runner_title_falls_back_to_realtime_transcript() -> None:
         def fail_batch(*_: object) -> str:
             raise RuntimeError("batch failed")
 
-        def title_from(text: str, _: str) -> str:
+        def title_from(text: str, _: str, __: object) -> str:
             title_inputs.append(text)
             return "Realtime title"
 
@@ -360,6 +365,53 @@ def test_websocket_ping_pong() -> None:
                 assert websocket.receive_json()["type"] == "status"
                 websocket.send_json({"type": "ping"})
                 assert websocket.receive_json() == {"type": "pong"}
+
+
+def test_websocket_start_uses_saved_model() -> None:
+    captured: dict[str, object] = {}
+
+    class CapturingRunner:
+        def __init__(self, session: Session, *_: object, **kwargs: object) -> None:
+            self.session = session
+            captured.update(kwargs)
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+        def feed_audio(self, _: bytes) -> bool:
+            return True
+
+    environment = {
+        "TRANSCRIBE_WEBAPP_ROOT": tempfile.mkdtemp(),
+        "ELEVENLABS_API_KEY": "test-elevenlabs-key",
+        "OPENAI_API_KEY": "test-openai-key",
+        "DEEPSEEK_API_KEY": "test-deepseek-key",
+    }
+    with patch.dict(os.environ, environment), TestClient(app) as client:
+        app.state.runner_factory = CapturingRunner
+        try:
+            session = client.post("/api/sessions").json()
+            client.patch(
+                f"/api/sessions/{session['id']}/model",
+                json={"provider": "deepseek", "model": "deepseek-v4-flash"},
+            )
+            with client.websocket_connect(
+                f"/api/sessions/{session['id']}/ws"
+            ) as websocket:
+                assert websocket.receive_json()["type"] == "status"
+                websocket.send_json({"type": "start", "sample_rate": 16_000})
+                websocket.send_json({"type": "ping"})
+                assert websocket.receive_json() == {"type": "pong"}
+                assert captured["deepseek_key"] == "test-deepseek-key"
+                assert captured["openai_key"] == "test-openai-key"
+                started = app.state.store.get(session["id"])
+                assert started.ai_provider == "deepseek"
+                assert started.ai_model == "deepseek-v4-flash"
+        finally:
+            del app.state.runner_factory
 
 
 def main() -> None:

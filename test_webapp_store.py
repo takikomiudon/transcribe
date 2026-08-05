@@ -21,7 +21,8 @@ def test_config_helpers_and_api_keys() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         (root / ".env.local").write_text(
-            "ELEVENLABS_API_KEY=eleven\nOPENAI_API_KEY=openai\n",
+            "ELEVENLABS_API_KEY=eleven\nOPENAI_API_KEY=openai\n"
+            "DEEPSEEK_API_KEY=deepseek\n",
             encoding="utf-8",
         )
         with patch.dict(os.environ, {"TRANSCRIBE_WEBAPP_ROOT": str(root)}):
@@ -29,6 +30,7 @@ def test_config_helpers_and_api_keys() -> None:
             config.ensure_dirs(root)
             assert config.elevenlabs_key(root) == "eleven"
             assert config.openai_key(root) == "openai"
+            assert config.deepseek_key(root) == "deepseek"
 
         assert config.transcripts_dir(root) == root / "transcripts"
         assert config.recordings_dir(root) == root / "recordings"
@@ -71,6 +73,29 @@ def test_create_get_list_and_id_collision() -> None:
             "cards_html": "cards_output/20260805-140000.html",
         }
         assert first.resumable
+        assert first.ai_provider == "openai"
+        assert first.ai_model == "gpt-5.6-luna"
+
+
+def test_legacy_session_defaults_to_luna_and_upgrades_on_save() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        store = SessionStore(root)
+        session = store.create(datetime(2026, 8, 5, 14, 0, tzinfo=JST))
+        manifest = root / f"sessions/{session.id}.json"
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+        value.pop("ai_provider")
+        value.pop("ai_model")
+        manifest.write_text(json.dumps(value), encoding="utf-8")
+
+        loaded = store.get(session.id)
+        assert loaded.ai_provider == "openai"
+        assert loaded.ai_model == "gpt-5.6-luna"
+
+        store.save(loaded)
+        saved = json.loads(manifest.read_text(encoding="utf-8"))
+        assert saved["ai_provider"] == "openai"
+        assert saved["ai_model"] == "gpt-5.6-luna"
 
 
 def test_rename_and_delete_related_files() -> None:

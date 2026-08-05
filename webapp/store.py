@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import ai
 from webapp.config import cards_dir, recordings_dir, sessions_dir, transcripts_dir
 
 
@@ -31,6 +32,8 @@ class Session:
     finalized: bool
     origin: str
     paths: dict[str, str]
+    ai_provider: str
+    ai_model: str
     _root: Path = field(default=Path("."), repr=False, compare=False)
 
     @property
@@ -51,6 +54,8 @@ class Session:
             "finalized": self.finalized,
             "origin": self.origin,
             "paths": self.paths,
+            "ai_provider": self.ai_provider,
+            "ai_model": self.ai_model,
         }
 
     @classmethod
@@ -68,6 +73,8 @@ class Session:
             finalized=value["finalized"],
             origin=value["origin"],
             paths=value["paths"],
+            ai_provider=value.get("ai_provider", ai.DEFAULT_AI_MODEL.provider),
+            ai_model=value.get("ai_model", ai.DEFAULT_AI_MODEL.model),
             _root=root,
         )
 
@@ -105,7 +112,7 @@ class SessionStore:
             suffix += 1
         iso_timestamp = timestamp.isoformat(timespec="seconds")
         session = Session(
-            version=1,
+            version=2,
             id=id,
             title=None,
             title_source=None,
@@ -117,6 +124,8 @@ class SessionStore:
             finalized=False,
             origin="web",
             paths=_session_paths(id),
+            ai_provider=ai.DEFAULT_AI_MODEL.provider,
+            ai_model=ai.DEFAULT_AI_MODEL.model,
             _root=self.root,
         )
         self.save(session)
@@ -201,7 +210,7 @@ class SessionStore:
             audio_path = _root_path(self.root, paths["audio"])
             iso_timestamp = timestamp.isoformat(timespec="seconds")
             session = Session(
-                version=1,
+                version=2,
                 id=stem,
                 title=None,
                 title_source=None,
@@ -215,6 +224,8 @@ class SessionStore:
                 ).is_file(),
                 origin="cli",
                 paths=paths,
+                ai_provider=ai.DEFAULT_AI_MODEL.provider,
+                ai_model=ai.DEFAULT_AI_MODEL.model,
                 _root=self.root,
             )
             self.save(session)

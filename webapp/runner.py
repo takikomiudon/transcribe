@@ -15,6 +15,7 @@ from typing import Any, TextIO
 import cards
 import transcribe
 import viewer
+import ai
 from webapp.store import Session, SessionStore
 from webapp.titles import generate_title
 from webapp.wav import WavAppender
@@ -65,6 +66,7 @@ class SessionRunner:
         title_fn: Callable[..., str | None] | None = generate_title,
         elevenlabs_key: str = "",
         openai_key: str = "",
+        deepseek_key: str = "",
         curl_path: str = "curl",
         refresh_interval: float = 30.0,
         registry: RunnerRegistry | None = None,
@@ -86,6 +88,11 @@ class SessionRunner:
         self.title_fn = title_fn
         self.elevenlabs_key = elevenlabs_key
         self.openai_key = openai_key
+        self.deepseek_key = deepseek_key
+        self.ai_model = ai.model_from_values(session.ai_provider, session.ai_model)
+        self.ai_key = ai.api_key_for(
+            self.ai_model, self.openai_key, self.deepseek_key
+        )
         self.curl_path = curl_path
         self.refresh_interval = refresh_interval
         self.registry = registry
@@ -153,9 +160,10 @@ class SessionRunner:
                 self._path("cards"), self._path("cards_html")
             )
             self.pipeline = cards.CardPipeline(
-                self.openai_key,
+                self.ai_key,
                 store=card_store,
                 generator=self.card_generator,
+                model=self.ai_model,
             )
             self.pipeline.start()
             self._last_cards = _card_values(card_store.snapshot())
@@ -273,7 +281,10 @@ class SessionRunner:
             if text is not None:
                 try:
                     final_cards = await asyncio.to_thread(
-                        self.final_card_generator, text, self.openai_key
+                        self.final_card_generator,
+                        text,
+                        self.ai_key,
+                        self.ai_model,
                     )
                     cards.save_cards(final_cards, self._path("final_cards"))
                     await self._emit(
@@ -303,7 +314,10 @@ class SessionRunner:
                             self._path("transcript")
                         ) or ""
                         title = await asyncio.to_thread(
-                            self.title_fn, title_text, self.openai_key
+                            self.title_fn,
+                            title_text,
+                            self.ai_key,
+                            self.ai_model,
                         )
                         if title and title.strip():
                             self.session.title = title.strip()
@@ -392,7 +406,8 @@ class SessionRunner:
                         text,
                         context,
                         list(self.glossary),
-                        self.openai_key,
+                        self.ai_key,
+                        self.ai_model,
                     )
                 except Exception as error:
                     await self._emit_error(error, fatal=False)
@@ -466,7 +481,8 @@ class SessionRunner:
                 self.refresh_stop,
                 interval_seconds=self.refresh_interval,
                 glossary=self.glossary,
-                openai_api_key=self.openai_key,
+                openai_api_key=self.ai_key,
+                model=self.ai_model,
             )
         finally:
             transcribe.batch_transcribe = original_batch

@@ -18,13 +18,16 @@ from webapp.wav import WavAppender
 
 
 @contextmanager
-def api_client() -> Iterator[tuple[TestClient, Path]]:
+def api_client(
+    deepseek_key: str = "",
+) -> Iterator[tuple[TestClient, Path]]:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         environment = {
             "TRANSCRIBE_WEBAPP_ROOT": str(root),
             "ELEVENLABS_API_KEY": "test-elevenlabs-key",
             "OPENAI_API_KEY": "test-openai-key",
+            "DEEPSEEK_API_KEY": deepseek_key,
         }
         with patch.dict(os.environ, environment):
             with TestClient(app) as client:
@@ -69,6 +72,62 @@ def test_post_get_and_list_roundtrip() -> None:
             first_session["id"],
         ]
 
+
+def test_config_lists_only_configured_models() -> None:
+    with api_client() as (client, _):
+        payload = client.get("/api/config").json()
+        assert payload["default_model"] == {
+            "provider": "openai",
+            "model": "gpt-5.6-luna",
+            "label": "GPT-5.6 Luna",
+        }
+        assert [model["model"] for model in payload["models"]] == [
+            "gpt-5.6-luna"
+        ]
+
+    with api_client("deepseek-key") as (client, _):
+        assert [model["model"] for model in client.get("/api/config").json()["models"]] == [
+            "gpt-5.6-luna",
+            "deepseek-v4-flash",
+        ]
+
+
+def test_model_can_be_selected_before_recording_only() -> None:
+    with api_client("deepseek-key") as (client, _):
+        session = client.post("/api/sessions").json()
+        id = session["id"]
+        selected = client.patch(
+            f"/api/sessions/{id}/model",
+            json={"provider": "deepseek", "model": "deepseek-v4-flash"},
+        )
+        assert selected.status_code == 200
+        assert selected.json()["ai_provider"] == "deepseek"
+        assert selected.json()["ai_model"] == "deepseek-v4-flash"
+
+        stored = app.state.store.get(id)
+        stored.has_audio = True
+        app.state.store.save(stored)
+        locked = client.patch(
+            f"/api/sessions/{id}/model",
+            json={"provider": "openai", "model": "gpt-5.6-luna"},
+        )
+        assert locked.status_code == 409
+
+
+def test_model_selection_rejects_unknown_or_unconfigured_model() -> None:
+    with api_client() as (client, _):
+        id = client.post("/api/sessions").json()["id"]
+        unknown = client.patch(
+            f"/api/sessions/{id}/model",
+            json={"provider": "deepseek", "model": "deepseek-v4-flash"},
+        )
+        assert unknown.status_code == 422
+
+        invalid = client.patch(
+            f"/api/sessions/{id}/model",
+            json={"provider": "openai", "model": "unknown"},
+        )
+        assert invalid.status_code == 422
 
 def test_detail_reads_transcripts_and_cards() -> None:
     with api_client() as (client, root):

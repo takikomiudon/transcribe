@@ -8,6 +8,7 @@ from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+import ai
 from webapp.runner import (
     RunnerBusyError,
     SessionNotResumableError,
@@ -142,23 +143,31 @@ async def _start(websocket: WebSocket, id: str, command: dict[str, Any]) -> None
         await _send_error(websocket, "このセッションには既に録音接続があります。")
         return
 
+    try:
+        model = ai.model_from_values(session.ai_provider, session.ai_model)
+        ai.api_key_for(model, state.openai_key, state.deepseek_key)
+    except ValueError as error:
+        await _send_error(websocket, str(error))
+        return
+
     factory: Callable[..., SessionRunner] = getattr(
         state, "runner_factory", SessionRunner
     )
-    runner = factory(
-        session,
-        state.store,
-        state.root,
-        elevenlabs_key=state.elevenlabs_key,
-        openai_key=state.openai_key,
-        curl_path=state.curl_path,
-        registry=state.registry,
-        broadcast=lambda event: hub.broadcast(id, event),
-    )
     try:
+        runner = factory(
+            session,
+            state.store,
+            state.root,
+            elevenlabs_key=state.elevenlabs_key,
+            openai_key=state.openai_key,
+            deepseek_key=state.deepseek_key,
+            curl_path=state.curl_path,
+            registry=state.registry,
+            broadcast=lambda event: hub.broadcast(id, event),
+        )
         hub.reserve(id, websocket, runner)
         await runner.start()
-    except (RunnerBusyError, SessionNotResumableError) as error:
+    except (RunnerBusyError, SessionNotResumableError, ValueError) as error:
         hub.finish(id, websocket)
         await _send_error(websocket, str(error))
     except Exception:

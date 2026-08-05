@@ -7,6 +7,7 @@ import re
 import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +16,11 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 
+import ai
 from cards import Card
 from viewer import viewer_page
 from webapp.config import (
+    deepseek_key,
     elevenlabs_key,
     ensure_dirs,
     get_root,
@@ -37,6 +40,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     ensure_dirs(root)
     elevenlabs_api_key = elevenlabs_key(root)
     openai_api_key = openai_key(root)
+    deepseek_api_key = deepseek_key(root)
     if not elevenlabs_api_key:
         raise RuntimeError(
             "ELEVENLABS_API_KEYが環境変数または.env.localに設定されていません。"
@@ -56,6 +60,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     application.state.store = store
     application.state.elevenlabs_key = elevenlabs_api_key
     application.state.openai_key = openai_api_key
+    application.state.deepseek_key = deepseek_api_key
     application.state.curl_path = curl_path
     application.state.registry = RunnerRegistry()
     application.state.hub = WebSocketHub()
@@ -79,6 +84,11 @@ class RenameRequest(BaseModel):
         return title
 
 
+class ModelSelectionRequest(BaseModel):
+    provider: str
+    model: str
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -90,6 +100,15 @@ def api_status(request: Request) -> dict[str, str | None]:
     return {
         "active_session_id": active,
         "state": "recording" if active is not None else "idle",
+    }
+
+
+@app.get("/api/config")
+def api_config(request: Request) -> dict[str, Any]:
+    models = ai.available_models(request.app.state.deepseek_key)
+    return {
+        "default_model": _model_value(ai.DEFAULT_AI_MODEL),
+        "models": [_model_value(model) for model in models],
     }
 
 
@@ -136,6 +155,35 @@ def rename_session(
 ) -> dict[str, Any]:
     _session(request, id)
     return _summary(_store(request).rename(id, body.title))
+
+
+@app.patch("/api/sessions/{id}/model")
+def select_model(
+    id: str, body: ModelSelectionRequest, request: Request
+) -> dict[str, Any]:
+    session = _session(request, id)
+    if session.state == "recording" or session.has_audio:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="録音開始後はモデルを変更できません。",
+        )
+    try:
+        model = ai.model_from_values(body.provider, body.model)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(error),
+        ) from error
+    if model.provider == ai.DEEPSEEK_PROVIDER and not request.app.state.deepseek_key:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="DeepSeek APIキーが設定されていません。",
+        )
+    session.ai_provider = model.provider
+    session.ai_model = model.model
+    session.updated_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    _store(request).save(session)
+    return _summary(session)
 
 
 @app.delete("/api/sessions/{id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -203,6 +251,14 @@ def _summary(session: Session) -> dict[str, Any]:
     summary.pop("paths")
     summary["resumable"] = session.resumable
     return summary
+
+
+def _model_value(model: ai.AIModel) -> dict[str, str]:
+    return {
+        "provider": model.provider,
+        "model": model.model,
+        "label": model.label,
+    }
 
 
 def _path(request: Request, session: Session, name: str) -> Path:

@@ -45,3 +45,7 @@ def elevenlabs_key(root: Path) -> str:
 
 def openai_key(root: Path) -> str:
     return transcribe.load_api_key("OPENAI_API_KEY", root / ".env.local")
+
+
+def deepseek_key(root: Path) -> str:
+    return transcribe.load_api_key("DEEPSEEK_API_KEY", root / ".env.local")
