@@ -30,7 +30,6 @@ Raycastから起動する場合は、使用する音声入力番号も設定で�
 ```sh
 ELEVENLABS_API_KEY='your-elevenlabs-api-key'
 OPENAI_API_KEY='your-openai-api-key'
-# WebアプリでDeepSeek V4 Flashを使う場合だけ設定
 DEEPSEEK_API_KEY='your-deepseek-api-key'
 TRANSCRIBE_DEVICE=0
 ```
@@ -86,7 +85,7 @@ uv run -m webapp
 
 Webアプリではセッション履歴を残し、録音の開始・停止・同じセッションへの再開ができます。録音したWAVは最終処理後も常に保持し、削除する場合はセッションメニューから明示的に操作します。
 
-録音開始前はヘッダーのAIモデル選択から `GPT-5.6 Luna` と `DeepSeek V4 Flash` をセッション単位で切り替えられます。新規セッションの既定値はOpenAI `gpt-5.6-luna`です。`DEEPSEEK_API_KEY` を設定した場合だけ、公式APIの `deepseek-v4-flash` が選択肢に表示されます。`deepseek-v4-flash-0731` は公式モデル一覧にないため対象外です（[DeepSeek公式モデル・料金一覧](https://api-docs.deepseek.com/quick_start/pricing)）。録音開始後はモデルを変更できず、停止後に再開しても録音開始時のモデルを使います。
+録音開始前はヘッダーのAIモデル選択から `GPT-5.6 Luna` と `DeepSeek V4 Flash` をセッション単位で切り替えられます。新規セッションの既定値はOpenAI `gpt-5.6-luna`です。`DEEPSEEK_API_KEY` を設定した場合だけ、公式APIの `deepseek-v4-flash` が選択肢に表示されます。録音開始後はモデルを変更できず、停止後に再開しても録音開始時のモデルを使います。
 
 CLIはWebアプリから独立しており、従来どおり `uv run transcribe.py` で利用できます。CLIはstdlibとwebsocketsだけを使う方針を維持します。WebアプリはFastAPIとuvicornを使用し、依存は `pyproject.toml` で管理します。
 
