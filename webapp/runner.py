@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import Any, TextIO
 
 import cards
+import card_compiler
+import card_renderer
 import transcribe
+import transcript_segments
 import viewer
 import ai
 from websockets.exceptions import WebSocketException
@@ -30,9 +33,233 @@ class SessionNotResumableError(RuntimeError):
     pass
 
 
+def _ignore_event(_: dict[str, Any]) -> None:
+    pass
+
+
+class _EventEmitter:
+    session: Session
+    broadcast: Callable[[dict[str, Any]], Awaitable[None] | None]
+
+    async def _emit(self, event: dict[str, Any]) -> None:
+        result = self.broadcast(event)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _emit_error(self, error: Exception, *, fatal: bool) -> None:
+        await self._emit(
+            {"type": "error", "message": str(error), "fatal": fatal}
+        )
+
+    async def _emit_session(self) -> None:
+        await self._emit({"type": "session", "session": _session_value(self.session)})
+
+    async def _emit_status(self, state: str) -> None:
+        active_session_id: str | None = None
+        if self.session.state == "recording":
+            active_session_id = self.session.id
+        await self._emit(
+            {
+                "type": "status",
+                "active_session_id": active_session_id,
+                "state": state,
+            }
+        )
+
+
+class SessionFinalizer(_EventEmitter):
+    def __init__(
+        self,
+        session: Session,
+        store: SessionStore,
+        root: Path,
+        *,
+        elevenlabs_key: str,
+        openai_key: str = "",
+        deepseek_key: str = "",
+        curl_path: str = "curl",
+        broadcast: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
+        batch_words_fn: Callable[..., transcript_segments.BatchTranscript] = (
+            transcribe.batch_transcribe_with_words
+        ),
+        final_compiler: Callable[..., card_compiler.CompilationResult] = (
+            card_compiler.compile_final_knowledge
+        ),
+        final_renderer: Callable[..., list[cards.Card]] = card_renderer.render_cards,
+        title_fn: Callable[..., str | None] | None = generate_title,
+    ) -> None:
+        self.session = session
+        self.store = store
+        self.root = root
+        self.elevenlabs_key = elevenlabs_key
+        self.openai_key = openai_key
+        self.deepseek_key = deepseek_key
+        self.curl_path = curl_path
+        self.broadcast = _ignore_event
+        if broadcast is not None:
+            self.broadcast = broadcast
+        self.batch_words_fn = batch_words_fn
+        self.final_compiler = final_compiler
+        self.final_renderer = final_renderer
+        self.title_fn = title_fn
+        self.ai_model = ai.model_from_values(session.ai_provider, session.ai_model)
+        self._ai_credentials()
+
+    def _ai_credentials(self) -> tuple[str, ai.AIModel]:
+        model = ai.effective_model(self.ai_model)
+        key = ai.api_key_for(model, self.openai_key, self.deepseek_key)
+        return key, model
+
+    async def run(self) -> None:
+        await self._emit_status("finalizing")
+        text: str | None = None
+        evidence_segments: list[transcript_segments.TranscriptSegment] = []
+        final_cards: list[cards.Card] = []
+        outline_topics: list[card_compiler.Topic] = []
+        try:
+            batch_transcript = await asyncio.to_thread(
+                self.batch_words_fn,
+                _session_path(self.root, self.session, "audio"),
+                self.elevenlabs_key,
+                self.curl_path,
+            )
+            text = batch_transcript.text
+            transcribe.write_batch_transcript(
+                _session_path(self.root, self.session, "transcript"), text
+            )
+            evidence_segments = transcript_segments.segment_transcript(
+                batch_transcript
+            )
+            transcript_segments.save_segments(
+                _session_path(self.root, self.session, "segments"),
+                self.session.id,
+                evidence_segments,
+            )
+            await self._emit(
+                {
+                    "type": "final_transcript",
+                    "text": text,
+                    "segments": [asdict(segment) for segment in evidence_segments],
+                }
+            )
+        except (
+            transcribe.BatchTranscriptionError,
+            OSError,
+            RuntimeError,
+        ) as error:
+            await self._emit_error(error, fatal=False)
+
+        if text is not None:
+            try:
+                key, model = self._ai_credentials()
+                compilation = await asyncio.to_thread(
+                    self.final_compiler,
+                    evidence_segments,
+                    key,
+                    model,
+                )
+                self.session.processing_warnings.extend(
+                    warning
+                    for warning in compilation.warnings
+                    if warning not in self.session.processing_warnings
+                )
+                card_compiler.save_compilation(
+                    compilation,
+                    self.session.id,
+                    _session_path(self.root, self.session, "outline"),
+                    _session_path(self.root, self.session, "knowledge"),
+                )
+                final_cards = self.final_renderer(
+                    compilation.topics,
+                    compilation.units,
+                    evidence_segments,
+                )
+                outline_topics = compilation.topics
+                cards.save_cards(
+                    final_cards,
+                    _session_path(self.root, self.session, "final_cards"),
+                )
+                await self._emit(
+                    {
+                        "type": "cards_final",
+                        "cards": _card_values(final_cards),
+                        "outline": [asdict(topic) for topic in outline_topics],
+                        "knowledge": [
+                            asdict(unit) for unit in compilation.units
+                        ],
+                    }
+                )
+            except (
+                cards.CardGenerationError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as error:
+                await self._emit_error(error, fatal=False)
+
+        try:
+            live_store = cards.CardStore.attach(
+                _session_path(self.root, self.session, "cards"),
+                _session_path(self.root, self.session, "cards_html"),
+            )
+            live_cards = live_store.snapshot()
+            if final_cards:
+                live_cards = cards.reconcile_live_cards(live_cards, final_cards)
+                live_store.replace_all(live_cards)
+            await self._emit(
+                {"type": "cards", "cards": _card_values(live_cards)}
+            )
+            viewer.export_cards(
+                live_cards,
+                _session_path(self.root, self.session, "cards_html"),
+                final_cards=final_cards,
+                topics=outline_topics,
+            )
+        except (
+            cards.CardGenerationError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as error:
+            await self._emit_error(error, fatal=False)
+
+        if self.title_fn is not None and self.session.title_source != "user":
+            try:
+                title_text = text
+                if title_text is None:
+                    title_text = _transcript_body(
+                        _session_path(self.root, self.session, "transcript")
+                    )
+                if title_text is None:
+                    title_text = ""
+                key, model = self._ai_credentials()
+                title = await asyncio.to_thread(
+                    self.title_fn,
+                    title_text,
+                    key,
+                    model,
+                )
+                if title is not None and title.strip():
+                    self.session.title = title.strip()
+                    self.session.title_source = "auto"
+            except (
+                transcribe.TranslationError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as error:
+                await self._emit_error(error, fatal=False)
+
+        self.session.finalized = True
+        self.session.updated_at = _now()
+        _save_session_to_store(self.store, self.session)
+        await self._emit_session()
+
+
 class RunnerRegistry:
     def __init__(self) -> None:
         self.active: SessionRunner | Any | None = None
+        self.finalizing: dict[str, asyncio.Task[None]] = {}
 
     def start(self, runner: SessionRunner | Any) -> None:
         if self.active is not None and self.active is not runner:
@@ -49,7 +276,34 @@ class RunnerRegistry:
         return self.active.session.id if self.active is not None else None
 
 
-class SessionRunner:
+async def run_finalizer(
+    start: asyncio.Event,
+    registry: RunnerRegistry,
+    id: str,
+    finalizer: Any,
+    broadcast: Callable[[dict[str, Any]], Awaitable[None] | None],
+) -> None:
+    try:
+        await start.wait()
+        await finalizer.run()
+    finally:
+        del registry.finalizing[id]
+        active = registry.active_session_id
+        state = "idle"
+        if active is not None:
+            state = "recording"
+        result = broadcast(
+            {
+                "type": "status",
+                "active_session_id": active,
+                "state": state,
+            }
+        )
+        if inspect.isawaitable(result):
+            await result
+
+
+class SessionRunner(_EventEmitter):
     def __init__(
         self,
         session: Session,
@@ -58,19 +312,23 @@ class SessionRunner:
         *,
         connect: Callable[..., Any] | None = None,
         batch_fn: Callable[..., str] = transcribe.batch_transcribe,
+        batch_words_fn: Callable[..., transcript_segments.BatchTranscript] = (
+            transcribe.batch_transcribe_with_words
+        ),
         correct_fn: Callable[..., str] = transcribe.correct_transcript,
         glossary_fn: Callable[..., list[str]] = transcribe.extract_glossary,
         card_generator: Callable[..., dict[str, object]] = cards.generate_card,
-        final_card_generator: Callable[..., list[cards.Card]] = (
-            cards.generate_final_cards
+        final_compiler: Callable[..., card_compiler.CompilationResult] = (
+            card_compiler.compile_final_knowledge
         ),
+        final_renderer: Callable[..., list[cards.Card]] = card_renderer.render_cards,
         title_fn: Callable[..., str | None] | None = generate_title,
         elevenlabs_key: str = "",
         openai_key: str = "",
         deepseek_key: str = "",
         curl_path: str = "curl",
         refresh_interval: float = 30.0,
-        registry: RunnerRegistry | None = None,
+        registry: RunnerRegistry,
         broadcast: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
     ) -> None:
         if connect is None:
@@ -82,10 +340,12 @@ class SessionRunner:
         self.root = root
         self.connect = connect
         self.batch_fn = batch_fn
+        self.batch_words_fn = batch_words_fn
         self.correct_fn = correct_fn
         self.glossary_fn = glossary_fn
         self.card_generator = card_generator
-        self.final_card_generator = final_card_generator
+        self.final_compiler = final_compiler
+        self.final_renderer = final_renderer
         self.title_fn = title_fn
         self.elevenlabs_key = elevenlabs_key
         self.ai_model = ai.model_from_values(session.ai_provider, session.ai_model)
@@ -122,6 +382,7 @@ class SessionRunner:
         self._started = False
         self._stopping = False
         self._stopped = False
+        self._skip_corrections = False
         self._accepting_audio = False
         self._last_cards: list[dict[str, Any]] = []
 
@@ -134,12 +395,12 @@ class SessionRunner:
         self,
         source_text: str,
         _: str,
-        previous: cards.Card | None,
+        candidates: list[dict[str, object]],
         glossary: list[str],
         __: ai.AIModel,
     ) -> dict[str, object]:
         key, model = self._ai_credentials()
-        return self.card_generator(source_text, key, previous, glossary, model)
+        return self.card_generator(source_text, key, candidates, glossary, model)
 
     def _extract_glossary(
         self, text: str, _: str, __: ai.AIModel
@@ -236,11 +497,13 @@ class SessionRunner:
         self.audio_queue.put_nowait(pcm)
         return True
 
-    async def stop(self) -> None:
+    async def stop(self, *, finalize: bool = True) -> None:
         async with self._stop_lock:
             if self._stopped or not self._started:
                 return
             self._stopping = True
+            if not finalize:
+                self._skip_corrections = True
             self._accepting_audio = False
             await self._emit_status("stopping")
             expected_commits = self.reducer.commits_received + 1
@@ -298,56 +561,15 @@ class SessionRunner:
             self.session.updated_at = _now()
             self._save_session()
 
-            await self._emit_status("finalizing")
-            text: str | None = None
-            final_cards: list[cards.Card] = []
-            try:
-                text = await asyncio.to_thread(
-                    self.batch_fn,
-                    self._path("audio"),
-                    self.elevenlabs_key,
-                    self.curl_path,
-                )
-                transcribe.write_batch_transcript(self._path("transcript"), text)
-                await self._emit({"type": "final_transcript", "text": text})
-            except (
-                transcribe.BatchTranscriptionError,
-                OSError,
-                RuntimeError,
-            ) as error:
-                await self._emit_error(error, fatal=False)
-
-            if text is not None:
-                try:
-                    key, model = self._ai_credentials()
-                    final_cards = await asyncio.to_thread(
-                        self.final_card_generator,
-                        text,
-                        key,
-                        model,
-                    )
-                    cards.save_cards(final_cards, self._path("final_cards"))
-                    await self._emit(
-                        {"type": "cards_final", "cards": _card_values(final_cards)}
-                    )
-                except (
-                    cards.CardGenerationError,
-                    OSError,
-                    RuntimeError,
-                    ValueError,
-                ) as error:
-                    await self._emit_error(error, fatal=False)
-
-            live_cards: list[cards.Card] = []
             try:
                 assert self.pipeline is not None
-                live_cards = await self.pipeline.close()
-                await self._broadcast_cards_if_changed(force=True)
-                viewer.export_cards(
-                    live_cards,
-                    self._path("cards_html"),
-                    final_cards=final_cards,
+                await self.pipeline.close(generate_pending=finalize)
+                self.session.processing_warnings.extend(
+                    warning
+                    for warning in self.pipeline.errors
+                    if warning not in self.session.processing_warnings
                 )
+                await self._broadcast_cards_if_changed(force=True)
             except (
                 cards.CardGenerationError,
                 OSError,
@@ -356,46 +578,47 @@ class SessionRunner:
             ) as error:
                 await self._emit_error(error, fatal=False)
 
-            if self.title_fn is not None:
-                self._save_session()
-                if self.session.title_source != "user":
-                    try:
-                        title_text = text or _transcript_body(
-                            self._path("transcript")
-                        ) or ""
-                        key, model = self._ai_credentials()
-                        title = await asyncio.to_thread(
-                            self.title_fn,
-                            title_text,
-                            key,
-                            model,
-                        )
-                        if title and title.strip():
-                            self.session.title = title.strip()
-                            self.session.title_source = "auto"
-                            self.session.updated_at = _now()
-                            self._save_session()
-                            await self._emit_session()
-                    except (
-                        transcribe.TranslationError,
-                        OSError,
-                        RuntimeError,
-                        ValueError,
-                    ) as error:
-                        await self._emit_error(error, fatal=False)
-
             self.session.state = "stopped"
-            self.session.finalized = True
             self.session.updated_at = _now()
             try:
                 self._save_session()
+            finally:
+                self.registry.release()
+                self._started = False
+                self._stopped = True
+
+            finalizer_start = asyncio.Event()
+            if finalize:
+                finalizer = SessionFinalizer(
+                    self.session,
+                    self.store,
+                    self.root,
+                    elevenlabs_key=self.elevenlabs_key,
+                    openai_key=self.openai_key,
+                    deepseek_key=self.deepseek_key,
+                    curl_path=self.curl_path,
+                    broadcast=self.broadcast,
+                    batch_words_fn=self.batch_words_fn,
+                    final_compiler=self.final_compiler,
+                    final_renderer=self.final_renderer,
+                    title_fn=self.title_fn,
+                )
+                task = asyncio.create_task(
+                    run_finalizer(
+                        finalizer_start,
+                        self.registry,
+                        self.session.id,
+                        finalizer,
+                        self.broadcast,
+                    )
+                )
+                self.registry.finalizing[self.session.id] = task
+
+            try:
                 await self._emit_session()
                 await self._emit_status("idle")
             finally:
-                if self.registry is not None:
-                    self.registry.release()
-                self._started = False
-                self._stopped = True
+                finalizer_start.set()
 
     async def _uplink(self) -> None:
         buffer = bytearray()
@@ -456,24 +679,25 @@ class SessionRunner:
                 if item is None:
                     return
                 seq, text = item
-                try:
-                    key, model = self._ai_credentials()
-                    corrected = await asyncio.to_thread(
-                        self.correct_fn,
-                        text,
-                        context,
-                        list(self.glossary),
-                        key,
-                        model,
-                    )
-                except (
-                    transcribe.TranslationError,
-                    OSError,
-                    RuntimeError,
-                    ValueError,
-                ) as error:
-                    await self._emit_error(error, fatal=False)
-                    corrected = text
+                corrected = text
+                if not self._skip_corrections:
+                    try:
+                        key, model = self._ai_credentials()
+                        corrected = await asyncio.to_thread(
+                            self.correct_fn,
+                            text,
+                            context,
+                            list(self.glossary),
+                            key,
+                            model,
+                        )
+                    except (
+                        transcribe.TranslationError,
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                    ) as error:
+                        await self._emit_error(error, fatal=False)
                 try:
                     await self._finalize(seq, corrected)
                 except (
@@ -652,42 +876,26 @@ class SessionRunner:
             self.registry.release()
         self._stopped = True
 
-    async def _emit(self, event: dict[str, Any]) -> None:
-        result = self.broadcast(event)
-        if inspect.isawaitable(result):
-            await result
-
-    async def _emit_error(self, error: Exception, *, fatal: bool) -> None:
-        await self._emit(
-            {"type": "error", "message": str(error), "fatal": fatal}
-        )
-
-    async def _emit_session(self) -> None:
-        await self._emit({"type": "session", "session": _session_value(self.session)})
-
-    async def _emit_status(self, state: str) -> None:
-        await self._emit(
-            {
-                "type": "status",
-                "active_session_id": (
-                    None if state == "idle" else self.session.id
-                ),
-                "state": state,
-            }
-        )
-
     def _save_session(self) -> None:
-        latest = self.store.get(self.session.id)
-        if latest is not None and latest.title_source == "user":
-            self.session.title = latest.title
-            self.session.title_source = "user"
-        self.store.save(self.session)
+        _save_session_to_store(self.store, self.session)
 
     def _path(self, name: str) -> Path:
-        root = self.root.resolve()
-        path = (root / self.session.paths[name]).resolve()
-        path.relative_to(root)
-        return path
+        return _session_path(self.root, self.session, name)
+
+
+def _save_session_to_store(store: SessionStore, session: Session) -> None:
+    latest = store.get(session.id)
+    if latest is not None and latest.title_source == "user":
+        session.title = latest.title
+        session.title_source = "user"
+    store.save(session)
+
+
+def _session_path(root: Path, session: Session, name: str) -> Path:
+    resolved_root = root.resolve()
+    path = (resolved_root / session.paths[name]).resolve()
+    path.relative_to(resolved_root)
+    return path
 
 
 def _now() -> str:

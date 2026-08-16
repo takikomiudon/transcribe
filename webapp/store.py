@@ -34,6 +34,7 @@ class Session:
     paths: dict[str, str]
     ai_provider: str
     ai_model: str
+    processing_warnings: list[str] = field(default_factory=list)
     _root: Path = field(default=Path("."), repr=False, compare=False)
 
     @property
@@ -56,10 +57,20 @@ class Session:
             "paths": self.paths,
             "ai_provider": self.ai_provider,
             "ai_model": self.ai_model,
+            "processing_warnings": self.processing_warnings,
         }
 
     @classmethod
     def from_dict(cls, value: dict[str, Any], root: Path) -> Session:
+        paths = dict(value["paths"])
+        if "segments" not in paths:
+            transcript_stem = Path(paths["transcript"]).stem
+            paths["segments"] = f"transcripts/{transcript_stem}-segments.json"
+        card_stem = Path(paths["cards"]).stem
+        if "outline" not in paths:
+            paths["outline"] = f"cards_output/{card_stem}-outline.json"
+        if "knowledge" not in paths:
+            paths["knowledge"] = f"cards_output/{card_stem}-knowledge.json"
         return cls(
             version=value["version"],
             id=value["id"],
@@ -72,9 +83,10 @@ class Session:
             has_audio=value["has_audio"],
             finalized=value["finalized"],
             origin=value["origin"],
-            paths=value["paths"],
+            paths=paths,
             ai_provider=value.get("ai_provider", ai.DEFAULT_AI_MODEL.provider),
             ai_model=value.get("ai_model", ai.DEFAULT_AI_MODEL.model),
+            processing_warnings=value.get("processing_warnings", []),
             _root=root,
         )
 
@@ -126,6 +138,7 @@ class SessionStore:
             paths=_session_paths(id),
             ai_provider=ai.DEFAULT_AI_MODEL.provider,
             ai_model=ai.DEFAULT_AI_MODEL.model,
+            processing_warnings=[],
             _root=self.root,
         )
         self.save(session)
@@ -226,6 +239,7 @@ class SessionStore:
                 paths=paths,
                 ai_provider=ai.DEFAULT_AI_MODEL.provider,
                 ai_model=ai.DEFAULT_AI_MODEL.model,
+                processing_warnings=[],
                 _root=self.root,
             )
             self.save(session)
@@ -258,9 +272,12 @@ def _session_paths(
     return {
         "transcript": f"transcripts/{transcript_stem}.md",
         "final_transcript": f"transcripts/{transcript_stem}-final.md",
+        "segments": f"transcripts/{transcript_stem}-segments.json",
         "audio": f"recordings/{audio_stem}.wav",
         "cards": f"cards_output/{card_stem}.json",
         "final_cards": f"cards_output/{card_stem}-final.json",
+        "outline": f"cards_output/{card_stem}-outline.json",
+        "knowledge": f"cards_output/{card_stem}-knowledge.json",
         "cards_html": f"cards_output/{card_stem}.html",
     }
 

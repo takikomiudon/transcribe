@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import shutil
@@ -19,6 +20,7 @@ from pydantic import BaseModel, field_validator
 
 import ai
 from cards import Card
+from card_models import Topic
 from viewer import viewer_page
 from webapp.config import (
     deepseek_key,
@@ -28,7 +30,7 @@ from webapp.config import (
     openai_key,
 )
 from webapp.store import Session, SessionStore
-from webapp.runner import RunnerRegistry
+from webapp.runner import RunnerRegistry, SessionFinalizer, run_finalizer
 from webapp.ws import WebSocketHub, router as websocket_router
 
 
@@ -65,7 +67,14 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     application.state.curl_path = curl_path
     application.state.registry = RunnerRegistry()
     application.state.hub = WebSocketHub()
-    yield
+    application.state.finalizing = application.state.registry.finalizing
+    try:
+        yield
+    finally:
+        tasks = list(application.state.finalizing.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 app = FastAPI(title="Transcribe", lifespan=lifespan)
@@ -148,6 +157,9 @@ def get_session(id: str, request: Request) -> dict[str, Any]:
         ),
         "cards": _json_list(_path(request, session, "cards")),
         "final_cards": _json_list(_path(request, session, "final_cards")),
+        "segments": _json_items(_path(request, session, "segments")),
+        "outline": _json_items(_path(request, session, "outline")),
+        "knowledge": _json_items(_path(request, session, "knowledge")),
     }
 
 
@@ -200,6 +212,45 @@ def delete_session(id: str, request: Request) -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@app.post(
+    "/api/sessions/{id}/finalize",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def finalize_session(id: str, request: Request) -> dict[str, str]:
+    session = _session(request, id)
+    state = request.app.state
+    if state.registry.active_session_id == id or session.state == "recording":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="録音中のセッションは再処理できません。",
+        )
+    if id in state.finalizing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="このセッションは再処理中です。",
+        )
+    if not _path(request, session, "audio").is_file():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="音声ファイルがないため再処理できません。",
+        )
+
+    factory = getattr(state, "finalizer_factory", SessionFinalizer)
+    finalizer = factory(
+        session,
+        state.store,
+        state.root,
+        elevenlabs_key=state.elevenlabs_key,
+        openai_key=state.openai_key,
+        deepseek_key=state.deepseek_key,
+        curl_path=state.curl_path,
+        broadcast=lambda event: state.hub.broadcast(id, event),
+    )
+    task = asyncio.create_task(_run_finalizer(request.app, id, finalizer))
+    state.finalizing[id] = task
+    return {"status": "accepted"}
+
+
 @app.get("/api/sessions/{id}/audio")
 def get_audio(id: str, request: Request) -> FileResponse:
     session = _session(request, id)
@@ -217,9 +268,11 @@ def export_session(id: str, request: Request) -> HTMLResponse:
     session = _session(request, id)
     cards = _json_list(_path(request, session, "cards"))
     final_cards = _json_list(_path(request, session, "final_cards"))
+    topics = _json_items(_path(request, session, "outline"))
     page = viewer_page(
         [Card(**card) for card in cards],
         final_cards=[Card(**card) for card in final_cards],
+        topics=[Topic(**topic) for topic in topics],
         cards_enabled=True,
         transcript_enabled=False,
     )
@@ -228,6 +281,18 @@ def export_session(id: str, request: Request) -> HTMLResponse:
         headers={
             "Content-Disposition": f'attachment; filename="{session.id}.html"'
         },
+    )
+
+
+async def _run_finalizer(application: FastAPI, id: str, finalizer: Any) -> None:
+    finalizer_start = asyncio.Event()
+    finalizer_start.set()
+    await run_finalizer(
+        finalizer_start,
+        application.state.registry,
+        id,
+        finalizer,
+        lambda event: application.state.hub.broadcast(id, event),
     )
 
 
@@ -278,3 +343,11 @@ def _json_list(path: Path) -> list[dict[str, Any]]:
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return []
+
+
+def _json_items(path: Path) -> list[dict[str, Any]]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    return value["items"]

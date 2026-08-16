@@ -64,8 +64,35 @@
 
         <audio id="audio-player" class="audio-player" controls preload="metadata" hidden></audio>
 
+        <nav class="knowledge-tabs" role="tablist" aria-label="セッション内容">
+          <button id="overview-tab" class="knowledge-tab" type="button" role="tab" data-view="overview" aria-selected="false" aria-controls="overview-panel" tabindex="-1">概要</button>
+          <button id="outline-tab" class="knowledge-tab" type="button" role="tab" data-view="outline" aria-selected="false" aria-controls="outline-panel" tabindex="-1">目次</button>
+          <button id="cards-tab" class="knowledge-tab" type="button" role="tab" data-view="cards" aria-selected="true" aria-controls="cards-panel" tabindex="0">カード</button>
+          <button id="full-tab" class="knowledge-tab" type="button" role="tab" data-view="full" aria-selected="false" aria-controls="full-panel" tabindex="-1">全文</button>
+        </nav>
+
         <div class="workspace">
-          <section class="transcript-panel panel" aria-labelledby="transcript-heading">
+          <section id="overview-panel" class="knowledge-panel panel" role="tabpanel" aria-labelledby="overview-tab" hidden>
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Overview</p>
+                <h2>概要</h2>
+              </div>
+            </div>
+            <div id="overview" class="overview-content"></div>
+          </section>
+
+          <section id="outline-panel" class="knowledge-panel panel" role="tabpanel" aria-labelledby="outline-tab" hidden>
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Outline</p>
+                <h2>目次</h2>
+              </div>
+            </div>
+            <nav id="outline" class="outline-content" aria-label="話題の目次"></nav>
+          </section>
+
+          <section id="full-panel" class="transcript-panel panel" role="tabpanel" aria-labelledby="full-tab" hidden>
             <div class="panel-header">
               <div>
                 <p class="eyebrow">Transcript</p>
@@ -83,7 +110,7 @@
             </div>
           </section>
 
-          <section class="cards-panel panel" aria-labelledby="cards-heading">
+          <section id="cards-panel" class="cards-panel panel" role="tabpanel" aria-labelledby="cards-tab">
             <div class="panel-header cards-header">
               <div>
                 <p class="eyebrow">Visual notes</p>

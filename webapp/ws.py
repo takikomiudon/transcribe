@@ -125,7 +125,7 @@ async def session_websocket(websocket: WebSocket, id: str) -> None:
         runner = hub.recorder(id, websocket)
         await hub.disconnect(id, websocket)
         if runner is not None:
-            await runner.stop()
+            await runner.stop(finalize=False)
             hub.finish(id, websocket)
 
 
@@ -138,6 +138,9 @@ async def _start(websocket: WebSocket, id: str, command: dict[str, Any]) -> None
     session = _get_session(state.store, id)
     if session is None:
         await _send_error(websocket, "セッションが見つかりません。")
+        return
+    if id in getattr(state, "finalizing", {}):
+        await _send_error(websocket, "再処理中は録音を開始できません。")
         return
     if not session.resumable:
         await _send_error(websocket, "このセッションは再開できません。")

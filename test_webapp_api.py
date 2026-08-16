@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -64,6 +65,9 @@ def test_post_get_and_list_roundtrip() -> None:
         assert detail.json()["final_transcript"] is None
         assert detail.json()["cards"] == []
         assert detail.json()["final_cards"] == []
+        assert detail.json()["segments"] == []
+        assert detail.json()["outline"] == []
+        assert detail.json()["knowledge"] == []
 
         listed = client.get("/api/sessions")
         assert listed.status_code == 200
@@ -100,11 +104,32 @@ def test_index_includes_accessible_model_selector() -> None:
         assert "AIモデル" in html
 
 
+def test_index_includes_topic_views_and_evidence_navigation() -> None:
+    with api_client() as (client, _):
+        html = client.get("/").text
+        script = client.get("/static/app.js").text
+
+        for label in ("概要", "目次", "カード", "全文"):
+            assert label in html
+        assert 'role="tablist"' in html
+        assert "jumpToEvidence" in script
+        assert "audioPlayer.currentTime" in script
+        assert "cardVersions.delete" in script
+
+
 def test_static_app_does_not_reconnect_after_server_shutdown() -> None:
     with api_client() as (client, _):
         script = client.get("/static/app.js").text
         assert "event.code === 1012" in script
         assert "event.code === 1001" in script
+
+
+def test_static_app_includes_reprocess_control() -> None:
+    with api_client() as (client, _):
+        script = client.get("/static/app.js").text
+
+        assert "再処理" in script
+        assert "/finalize" in script
 
 
 def test_model_can_be_selected_before_recording_only() -> None:
@@ -165,6 +190,50 @@ def test_detail_reads_transcripts_and_cards() -> None:
         (root / f"cards_output/{id}-final.json").write_text(
             json.dumps(final_cards), encoding="utf-8"
         )
+        segments = [
+            {
+                "id": "seg-0001",
+                "raw_text": "Raw evidence.",
+                "normalized_text": "Normalized evidence.",
+                "start_ms": 1_500,
+                "end_ms": 2_500,
+                "word_ids": ["word-000001"],
+                "speaker_id": None,
+                "uncertain_spans": [],
+            }
+        ]
+        outline = [
+            {
+                "id": "topic-0001",
+                "title": "Topic",
+                "summary": "Topic summary",
+                "segment_ids": ["seg-0001"],
+                "parent_id": None,
+                "order": 0,
+            }
+        ]
+        knowledge = [
+            {
+                "id": "unit-0001",
+                "topic_id": "topic-0001",
+                "kind": "claim",
+                "title": "Claim",
+                "summary": "Claim summary",
+                "items": [],
+                "evidence_segment_ids": ["seg-0001"],
+                "relations": [],
+                "status": "verified",
+            }
+        ]
+        for relative, items in (
+            (f"transcripts/{id}-segments.json", segments),
+            (f"cards_output/{id}-outline.json", outline),
+            (f"cards_output/{id}-knowledge.json", knowledge),
+        ):
+            (root / relative).write_text(
+                json.dumps({"schema_version": 2, "session_id": id, "items": items}),
+                encoding="utf-8",
+            )
 
         payload = client.get(f"/api/sessions/{id}").json()
 
@@ -175,6 +244,9 @@ def test_detail_reads_transcripts_and_cards() -> None:
         assert payload["final_transcript"] == "Final first.\n\nFinal second."
         assert payload["cards"] == cards
         assert payload["final_cards"] == final_cards
+        assert payload["segments"] == segments
+        assert payload["outline"] == outline
+        assert payload["knowledge"] == knowledge
 
 
 def test_patch_rename_and_reject_blank_title() -> None:
@@ -203,10 +275,83 @@ def test_unknown_session_returns_404() -> None:
             client.delete(f"/api/sessions/{id}"),
             client.get(f"/api/sessions/{id}/audio"),
             client.get(f"/api/sessions/{id}/export"),
+            client.post(f"/api/sessions/{id}/finalize"),
         ]
 
         assert all(response.status_code == 404 for response in responses)
         assert all("detail" in response.json() for response in responses)
+
+
+def test_finalize_session_runs_in_background_and_cleans_up() -> None:
+    runs: list[str] = []
+
+    class StubFinalizer:
+        def __init__(self, session, store, *_: object, **__: object) -> None:
+            self.session = session
+            self.store = store
+
+        async def run(self) -> None:
+            runs.append(self.session.id)
+            self.session.finalized = True
+            self.store.save(self.session)
+
+    with api_client() as (client, root):
+        session = client.post("/api/sessions").json()
+        id = session["id"]
+        stored = app.state.store.get(id)
+        stored.has_audio = True
+        stored.finalized = True
+        app.state.store.save(stored)
+        (root / stored.paths["audio"]).write_bytes(b"audio")
+        app.state.finalizer_factory = StubFinalizer
+        try:
+            response = client.post(f"/api/sessions/{id}/finalize")
+            assert response.status_code == 202
+            for _ in range(100):
+                saved = app.state.store.get(id)
+                if saved.finalized and id not in app.state.finalizing:
+                    break
+                time.sleep(0.01)
+            assert saved.finalized
+            assert runs == [id]
+            assert id not in app.state.finalizing
+        finally:
+            del app.state.finalizer_factory
+
+
+def test_finalize_session_rejects_recording_missing_audio_and_duplicate() -> None:
+    with api_client() as (client, root):
+        recording_id = client.post("/api/sessions").json()["id"]
+        recording = app.state.store.get(recording_id)
+        recording.has_audio = True
+        app.state.store.save(recording)
+        (root / recording.paths["audio"]).write_bytes(b"audio")
+        app.state.registry.start(SimpleNamespace(session=recording))
+        assert (
+            client.post(f"/api/sessions/{recording_id}/finalize").status_code
+            == 409
+        )
+        app.state.registry.release()
+
+        missing_id = client.post("/api/sessions").json()["id"]
+        missing = app.state.store.get(missing_id)
+        missing.has_audio = True
+        app.state.store.save(missing)
+        assert client.post(f"/api/sessions/{missing_id}/finalize").status_code == 409
+
+        duplicate_id = client.post("/api/sessions").json()["id"]
+        duplicate = app.state.store.get(duplicate_id)
+        duplicate.has_audio = True
+        app.state.store.save(duplicate)
+        (root / duplicate.paths["audio"]).write_bytes(b"audio")
+        app.state.finalizing[duplicate_id] = object()
+        try:
+            assert (
+                client.post(f"/api/sessions/{duplicate_id}/finalize").status_code
+                == 409
+            )
+        finally:
+            app.state.finalizing.pop(duplicate_id)
 
 
 def test_delete_removes_manifest_and_related_files() -> None:
@@ -242,6 +387,7 @@ def test_delete_active_session_returns_409() -> None:
 
 def test_status_reports_idle_and_active_session() -> None:
     with api_client() as (client, _):
+        assert app.state.finalizing is app.state.registry.finalizing
         page = client.get("/")
         assert page.status_code == 200
         assert "Transcribe" in page.text
@@ -283,6 +429,31 @@ def test_export_returns_self_contained_html() -> None:
         (root / f"cards_output/{id}.json").write_text(
             json.dumps([sample_card("Export title")]), encoding="utf-8"
         )
+        final_card = sample_card("Final export title")
+        final_card["topic_id"] = "topic-0001"
+        final_card["evidence_segment_ids"] = ["seg-0001"]
+        (root / f"cards_output/{id}-final.json").write_text(
+            json.dumps([final_card]), encoding="utf-8"
+        )
+        (root / f"cards_output/{id}-outline.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "session_id": id,
+                    "items": [
+                        {
+                            "id": "topic-0001",
+                            "title": "Export topic",
+                            "summary": "Summary",
+                            "segment_ids": ["seg-0001"],
+                            "parent_id": None,
+                            "order": 0,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
 
         response = client.get(f"/api/sessions/{id}/export")
 
@@ -292,6 +463,8 @@ def test_export_returns_self_contained_html() -> None:
             f'attachment; filename="{id}.html"'
         )
         assert "Export title" in response.text
+        assert "Export topic" in response.text
+        assert "showTopic" in response.text
 
 
 def test_lifespan_rejects_missing_api_keys_and_curl() -> None:
@@ -329,12 +502,15 @@ def main() -> None:
     test_detail_reads_transcripts_and_cards()
     test_patch_rename_and_reject_blank_title()
     test_unknown_session_returns_404()
+    test_finalize_session_runs_in_background_and_cleans_up()
+    test_finalize_session_rejects_recording_missing_audio_and_duplicate()
     test_delete_removes_manifest_and_related_files()
     test_delete_active_session_returns_409()
     test_status_reports_idle_and_active_session()
     test_audio_returns_wav_or_404()
     test_export_returns_self_contained_html()
     test_lifespan_rejects_missing_api_keys_and_curl()
+    test_static_app_includes_reprocess_control()
     print("ok")
 
 

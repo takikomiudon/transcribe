@@ -39,6 +39,8 @@ const elements = {
   cardsStatus: document.getElementById("cards-status"),
   liveCardsTab: document.getElementById("live-cards-tab"),
   finalCardsTab: document.getElementById("final-cards-tab"),
+  overview: document.getElementById("overview"),
+  outline: document.getElementById("outline"),
 };
 
 let currentDetail = null;
@@ -49,8 +51,12 @@ let transcriptItems = [];
 let partialText = "";
 let liveCards = [];
 let finalCards = [];
+let evidenceSegments = [];
+let outlineTopics = [];
+let knowledgeUnits = [];
 let finalReady = false;
 let activeCardView = "live";
+let activePrimaryView = "cards";
 let toastTimer = null;
 let headerRenameActive = false;
 let reconnectAttempt = 0;
@@ -58,6 +64,8 @@ let reconnectTimer = null;
 let recordingInterrupted = false;
 const cardVersions = new Map();
 const cardTabs = [elements.liveCardsTab, elements.finalCardsTab];
+const primaryTabs = [...document.querySelectorAll(".knowledge-tab")];
+const primaryPanels = [...document.querySelectorAll(".knowledge-panel, .transcript-panel, .cards-panel")];
 
 class Recorder {
   constructor() {
@@ -207,6 +215,21 @@ function bindControls() {
   elements.sidebarOverlay.addEventListener("click", () => setSidebarOpen(false));
   elements.liveTranscriptButton.addEventListener("click", () => setTranscriptMode("live"));
   elements.finalTranscriptButton.addEventListener("click", () => setTranscriptMode("final"));
+  for (const tab of primaryTabs) {
+    tab.addEventListener("click", () => selectPrimaryView(tab.dataset.view));
+    tab.addEventListener("keydown", event => {
+      const current = primaryTabs.indexOf(tab);
+      let next = -1;
+      if (event.key === "ArrowLeft") next = (current - 1 + primaryTabs.length) % primaryTabs.length;
+      if (event.key === "ArrowRight") next = (current + 1) % primaryTabs.length;
+      if (event.key === "Home") next = 0;
+      if (event.key === "End") next = primaryTabs.length - 1;
+      if (next < 0) return;
+      event.preventDefault();
+      primaryTabs[next].focus();
+      selectPrimaryView(primaryTabs[next].dataset.view);
+    });
+  }
   document.addEventListener("keydown", event => {
     if (event.key === "Escape") {
       const openMenuButton = document.querySelector('.session-menu-button[aria-expanded="true"]');
@@ -260,6 +283,9 @@ async function selectSession(id) {
   currentDetail = null;
   liveCards = [];
   finalCards = [];
+  evidenceSegments = [];
+  outlineTopics = [];
+  knowledgeUnits = [];
   finalReady = false;
   updateCardTabs();
   selectCardView("live");
@@ -322,7 +348,7 @@ function openSocket(id, reconnecting = false) {
         currentDetail.session.state = "stopped";
         upsertSession(currentDetail.session);
       }
-      showToast("録音が中断されました。サーバーで停止処理を続けています。");
+      showToast("録音を保存しました。「再処理」で最終結果を生成できます。");
     } else if (!socket.intentionalClose && !serverShutdown) {
       showToast("接続が切れました。再接続します。");
     }
@@ -368,6 +394,9 @@ function applySessionDetail(detail) {
   partialText = "";
   liveCards = detail.cards;
   finalCards = detail.final_cards;
+  evidenceSegments = detail.segments;
+  outlineTopics = detail.outline;
+  knowledgeUnits = detail.knowledge;
   finalReady = finalCards.length > 0 || detail.session.finalized;
   transcriptMode = "live";
   renderAll();
@@ -413,7 +442,11 @@ async function handleServerEvent(event) {
       applyCorrection(event.seq, event.text);
       break;
     case "final_transcript":
-      if (currentDetail) currentDetail.final_transcript = event.text;
+      if (currentDetail) {
+        currentDetail.final_transcript = event.text;
+        if (event.segments) currentDetail.segments = event.segments;
+      }
+      if (event.segments) evidenceSegments = event.segments;
       elements.finalTranscriptButton.disabled = false;
       if (transcriptMode === "final") renderTranscript();
       break;
@@ -424,7 +457,17 @@ async function handleServerEvent(event) {
     case "cards_final": {
       const firstFinal = !finalReady;
       finalCards = event.cards;
+      if (event.outline) {
+        outlineTopics = event.outline;
+        if (currentDetail) currentDetail.outline = event.outline;
+      }
+      if (event.knowledge) {
+        knowledgeUnits = event.knowledge;
+        if (currentDetail) currentDetail.knowledge = event.knowledge;
+      }
       finalReady = true;
+      renderOverview();
+      renderOutline();
       updateCardTabs();
       if (firstFinal) selectCardView("final", true);
       else if (activeCardView === "final") renderCards(finalCards);
@@ -492,6 +535,8 @@ function renderAll() {
   renderHeader();
   renderTranscript();
   renderAudio();
+  renderOverview();
+  renderOutline();
 }
 
 function renderSidebar() {
@@ -544,6 +589,13 @@ function sessionButton(session) {
     dot.setAttribute("aria-label", "録音中");
     select.append(dot);
   }
+  if (session.has_audio && !session.finalized && session.state !== "recording") {
+    const dot = document.createElement("span");
+    dot.className = "unfinalized-dot";
+    dot.title = "最終処理が未実行";
+    dot.setAttribute("aria-label", "最終処理が未実行");
+    select.append(dot);
+  }
   select.addEventListener("click", () => selectSession(session.id));
 
   const menuWrap = document.createElement("div");
@@ -567,6 +619,15 @@ function sessionButton(session) {
   rename.textContent = "名前を変更";
   rename.addEventListener("click", () => beginSidebarRename(session, item));
 
+  const reprocess = document.createElement("button");
+  reprocess.type = "button";
+  reprocess.className = "session-menu-action";
+  reprocess.setAttribute("role", "menuitem");
+  reprocess.textContent = "再処理";
+  reprocess.disabled = !session.has_audio || session.state === "recording" || state.status.active_session_id === session.id;
+  if (reprocess.disabled) reprocess.title = "停止済みの録音を再処理できます";
+  reprocess.addEventListener("click", () => reprocessSession(session, reprocess));
+
   const remove = document.createElement("button");
   remove.type = "button";
   remove.className = "session-menu-action danger-text";
@@ -583,7 +644,7 @@ function sessionButton(session) {
   exportLink.download = `${session.id}.html`;
   exportLink.textContent = "HTMLエクスポート";
 
-  menu.append(rename, remove, exportLink);
+  menu.append(rename, reprocess, remove, exportLink);
   menuButton.addEventListener("click", () => {
     const opening = menu.hidden;
     closeSessionMenus();
@@ -699,6 +760,23 @@ async function deleteSession(session) {
   } catch (sessionDeletionError) {
     if (!(sessionDeletionError instanceof Error)) throw sessionDeletionError;
     showToast(sessionDeletionError.message);
+  }
+}
+
+async function reprocessSession(session, button) {
+  button.disabled = true;
+  button.textContent = "再処理中…";
+  try {
+    await request(`/api/sessions/${encodeURIComponent(session.id)}/finalize`, {
+      method: "POST",
+    });
+    closeSessionMenus();
+    showToast("再処理を開始しました。");
+  } catch (sessionReprocessError) {
+    if (!(sessionReprocessError instanceof Error)) throw sessionReprocessError;
+    button.disabled = false;
+    button.textContent = "再処理";
+    showToast(sessionReprocessError.message);
   }
 }
 
@@ -850,7 +928,11 @@ function renderTranscript() {
     return;
   }
   if (transcriptMode === "final") {
-    appendParagraphs(splitParagraphs(currentDetail.final_transcript || ""));
+    if (evidenceSegments.length) {
+      for (const segment of evidenceSegments) appendEvidenceSegment(segment);
+    } else {
+      appendParagraphs(splitParagraphs(currentDetail.final_transcript || ""));
+    }
   } else {
     for (const item of transcriptItems) appendTranscriptItem(item);
     if (partialText) appendPartial(partialText);
@@ -864,6 +946,28 @@ function renderTranscript() {
   elements.liveTranscriptButton.setAttribute("aria-pressed", String(transcriptMode === "live"));
   elements.finalTranscriptButton.setAttribute("aria-pressed", String(transcriptMode === "final"));
   scrollToBottomIfNeeded(elements.transcriptScroll, atBottom);
+}
+
+function appendEvidenceSegment(segment) {
+  const section = document.createElement("section");
+  section.id = `transcript-${segment.id}`;
+  section.className = "evidence-segment";
+  section.tabIndex = -1;
+  section.dataset.segmentId = segment.id;
+  const raw = document.createElement("p");
+  raw.textContent = segment.raw_text;
+  section.append(raw);
+  if (segment.normalized_text !== segment.raw_text) {
+    const normalized = document.createElement("details");
+    normalized.className = "normalized-text";
+    const summary = document.createElement("summary");
+    summary.textContent = "正規化テキスト";
+    const text = document.createElement("p");
+    text.textContent = segment.normalized_text;
+    normalized.append(summary, text);
+    section.append(normalized);
+  }
+  elements.transcriptContent.append(section);
 }
 
 function appendParagraphs(paragraphs) {
@@ -944,11 +1048,19 @@ function cardElement(card) {
   const article = document.createElement("article");
   article.id = `card-${card.id}`;
   article.className = `card ${card.status === "error" ? "error" : ""}`;
+  article.tabIndex = -1;
+  if (card.topic_id) article.dataset.topicId = card.topic_id;
 
   const header = document.createElement("header");
   const title = document.createElement("h2");
   title.textContent = card.title;
   header.append(title);
+  if (card.status === "needs_review") {
+    const badge = document.createElement("span");
+    badge.className = "review-badge";
+    badge.textContent = "要確認";
+    header.append(badge);
+  }
 
   const content = document.createElement("div");
   content.className = "card-content";
@@ -961,14 +1073,33 @@ function cardElement(card) {
   source.textContent = card.source_text;
   details.append(summary, source);
   article.append(header, content, details);
+  if (card.evidence_segment_ids && card.evidence_segment_ids.length) {
+    const evidenceButton = document.createElement("button");
+    evidenceButton.type = "button";
+    evidenceButton.className = "evidence-button";
+    evidenceButton.textContent = "原文・音声へ";
+    evidenceButton.addEventListener("click", () => jumpToEvidence(card.evidence_segment_ids));
+    article.append(evidenceButton);
+  }
   return article;
 }
 
 function renderCards(cards, reset = false) {
+  if (activeCardView === "final" && outlineTopics.length) {
+    renderGroupedCards(cards);
+    return;
+  }
   const atBottom = nearBottom(elements.cards);
   if (reset) {
     elements.cards.textContent = "";
     cardVersions.clear();
+  }
+  const currentIds = new Set(cards.map(card => card.id));
+  for (const existing of elements.cards.querySelectorAll(":scope > .card")) {
+    const cardId = existing.id.replace(/^card-/, "");
+    if (currentIds.has(cardId)) continue;
+    existing.remove();
+    cardVersions.delete(cardId);
   }
   if (!cards.length && !elements.cards.querySelector(".empty")) {
     appendEmpty(elements.cards, "カードを待っています。");
@@ -984,6 +1115,156 @@ function renderCards(cards, reset = false) {
     cardVersions.set(card.id, version);
   }
   scrollToBottomIfNeeded(elements.cards, atBottom);
+}
+
+function renderGroupedCards(cards) {
+  elements.cards.textContent = "";
+  cardVersions.clear();
+  if (!cards.length) {
+    appendEmpty(elements.cards, "カードを待っています。");
+    return;
+  }
+  const rendered = new Set();
+  const topics = [...outlineTopics].sort((first, second) => first.order - second.order);
+  for (const topic of topics) {
+    const topicCards = cards.filter(card => card.topic_id === topic.id);
+    if (!topicCards.length) continue;
+    const section = document.createElement("section");
+    section.className = "topic-group";
+    section.id = `topic-${topic.id}`;
+    const heading = document.createElement("h3");
+    heading.textContent = topic.title;
+    const summary = document.createElement("p");
+    summary.className = "topic-summary";
+    summary.textContent = topic.summary;
+    section.append(heading, summary);
+    for (const card of topicCards) {
+      section.append(cardElement(card));
+      rendered.add(card.id);
+    }
+    elements.cards.append(section);
+  }
+  for (const card of cards) {
+    if (!rendered.has(card.id)) elements.cards.append(cardElement(card));
+  }
+}
+
+function selectPrimaryView(view) {
+  activePrimaryView = view;
+  for (const tab of primaryTabs) {
+    const selected = tab.dataset.view === view;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = -1;
+    if (selected) tab.tabIndex = 0;
+  }
+  for (const panel of primaryPanels) panel.hidden = panel.id !== `${view}-panel`;
+  if (view === "full" && currentDetail?.final_transcript) {
+    transcriptMode = "final";
+    renderTranscript();
+  }
+}
+
+function outlineList(parentId) {
+  const list = document.createElement("ol");
+  for (const topic of outlineTopics.filter(item => item.parent_id === parentId)) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = topic.title;
+    button.addEventListener("click", () => showTopic(topic));
+    const summary = document.createElement("p");
+    summary.textContent = topic.summary;
+    item.append(button, summary);
+    if (outlineTopics.some(child => child.parent_id === topic.id)) {
+      item.append(outlineList(topic.id));
+    }
+    list.append(item);
+  }
+  return list;
+}
+
+function renderOutline() {
+  elements.outline.textContent = "";
+  if (!outlineTopics.length) {
+    appendEmpty(elements.outline, "品質版の目次を待っています。");
+    return;
+  }
+  elements.outline.append(outlineList(null));
+}
+
+function showTopic(topic) {
+  selectPrimaryView("cards");
+  selectCardView("final", true);
+  setAudioTime(topic.segment_ids);
+  requestAnimationFrame(() => {
+    const card = elements.cards.querySelector(`[data-topic-id="${CSS.escape(topic.id)}"]`);
+    if (!card) return;
+    card.scrollIntoView({behavior: "smooth", block: "start"});
+    card.focus({preventScroll: true});
+  });
+}
+
+function jumpToEvidence(segmentIds) {
+  selectPrimaryView("full");
+  setTranscriptMode("final");
+  for (const segment of elements.transcriptContent.querySelectorAll(".evidence-segment")) {
+    segment.classList.toggle("selected-evidence", segmentIds.includes(segment.dataset.segmentId));
+  }
+  setAudioTime(segmentIds);
+  const first = elements.transcriptContent.querySelector(`[data-segment-id="${CSS.escape(segmentIds[0])}"]`);
+  if (!first) return;
+  first.scrollIntoView({behavior: "smooth", block: "center"});
+  first.focus({preventScroll: true});
+}
+
+function setAudioTime(segmentIds) {
+  const segment = evidenceSegments.find(item => segmentIds.includes(item.id) && typeof item.start_ms === "number");
+  if (!segment || elements.audioPlayer.hidden) return;
+  elements.audioPlayer.currentTime = segment.start_ms / 1000;
+}
+
+function renderOverview() {
+  elements.overview.textContent = "";
+  if (!currentDetail) {
+    appendEmpty(elements.overview, "セッションを選択してください。");
+    return;
+  }
+  const stats = document.createElement("dl");
+  stats.className = "overview-stats";
+  const values = [
+    ["主要トピック", String(outlineTopics.length)],
+    ["未確認の用語", String(knowledgeUnits.filter(unit => unit.status === "needs_review").length)],
+    ["処理警告", String(currentDetail.session.processing_warnings.length)],
+  ];
+  for (const [label, value] of values) {
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const description = document.createElement("dd");
+    description.textContent = value;
+    stats.append(term, description);
+  }
+  elements.overview.append(stats);
+  if (outlineTopics.length) {
+    const heading = document.createElement("h3");
+    heading.textContent = "重要ポイント";
+    const list = document.createElement("ul");
+    for (const topic of outlineTopics.filter(item => item.parent_id === null)) {
+      const item = document.createElement("li");
+      item.textContent = topic.summary;
+      list.append(item);
+    }
+    elements.overview.append(heading, list);
+  }
+  if (currentDetail.session.processing_warnings.length) {
+    const warnings = document.createElement("ul");
+    warnings.className = "processing-warnings";
+    for (const warning of currentDetail.session.processing_warnings) {
+      const item = document.createElement("li");
+      item.textContent = warning;
+      warnings.append(item);
+    }
+    elements.overview.append(warnings);
+  }
 }
 
 function selectCardView(view, announce = false) {

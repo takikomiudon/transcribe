@@ -67,9 +67,12 @@ def test_create_get_list_and_id_collision() -> None:
         assert first.paths == {
             "transcript": "transcripts/20260805-140000.md",
             "final_transcript": "transcripts/20260805-140000-final.md",
+            "segments": "transcripts/20260805-140000-segments.json",
             "audio": "recordings/20260805-140000.wav",
             "cards": "cards_output/20260805-140000.json",
             "final_cards": "cards_output/20260805-140000-final.json",
+            "outline": "cards_output/20260805-140000-outline.json",
+            "knowledge": "cards_output/20260805-140000-knowledge.json",
             "cards_html": "cards_output/20260805-140000.html",
         }
         assert first.resumable
@@ -91,6 +94,16 @@ def test_legacy_session_defaults_to_luna_and_upgrades_on_save() -> None:
         loaded = store.get(session.id)
         assert loaded.ai_provider == "openai"
         assert loaded.ai_model == "gpt-5.6-luna"
+        assert loaded.processing_warnings == []
+        assert loaded.paths["segments"] == (
+            "transcripts/20260805-140000-segments.json"
+        )
+        assert loaded.paths["outline"] == (
+            "cards_output/20260805-140000-outline.json"
+        )
+        assert loaded.paths["knowledge"] == (
+            "cards_output/20260805-140000-knowledge.json"
+        )
 
         store.save(loaded)
         saved = json.loads(manifest.read_text(encoding="utf-8"))
