@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from cards import Card
+from card_models import Topic
 
 
 VIEWER_HTML = """<!doctype html>
@@ -54,6 +55,12 @@ h1 { margin: 0; font-size: clamp(1.65rem, 4vw, 2.25rem); letter-spacing: -.03em;
 .card-tab:disabled { cursor: not-allowed; opacity: .45; }
 .card-tab:focus-visible { outline: 3px solid rgb(49 95 202 / 35%); outline-offset: 2px; }
 .card-status { min-height: 1.65em; margin: -4px 0 12px; color: var(--muted); font-size: .88rem; }
+.outline { margin: 0; padding: 16px 20px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); }
+.outline ol { margin: 8px 0 0; padding-left: 24px; }
+.outline button { border: 0; background: transparent; color: var(--accent-strong); font: inherit; font-weight: 700; cursor: pointer; text-align: left; }
+.outline button:hover { text-decoration: underline; }
+.outline button:focus-visible { outline: 3px solid rgb(49 95 202 / 35%); outline-offset: 2px; }
+.outline-summary { margin: 2px 0 8px; color: var(--muted); font-size: .88rem; }
 .transcript {
   min-height: 140px;
   margin: 0;
@@ -127,6 +134,10 @@ details pre { margin: 0; padding: 0 24px 20px; color: var(--muted); font: inheri
     <h2 id="transcript-heading">Final Transcript</h2>
     <pre id="transcript" class="transcript" aria-live="polite">最初の文字起こしを待っています。</pre>
   </section>
+  <nav id="outline-section" class="panel" aria-labelledby="outline-heading" hidden>
+    <h2 id="outline-heading">目次</h2>
+    <div id="outline" class="outline"></div>
+  </nav>
   <section id="cards-section" class="panel" aria-labelledby="cards-heading">
     <div class="cards-header">
       <h2 id="cards-heading">Diagram Cards</h2>
@@ -142,11 +153,14 @@ details pre { margin: 0; padding: 0 24px 20px; color: var(--muted); font: inheri
 <script>
 const INITIAL_CARDS = null;
 const INITIAL_FINAL_CARDS = null;
+const INITIAL_TOPICS = [];
 const CARDS_ENABLED = true;
 const TRANSCRIPT_ENABLED = true;
 const transcriptSection = document.getElementById("transcript-section");
 const transcript = document.getElementById("transcript");
 const cardsSection = document.getElementById("cards-section");
+const outlineSection = document.getElementById("outline-section");
+const outline = document.getElementById("outline");
 const root = document.getElementById("cards");
 const status = document.getElementById("cards-status");
 const finalTab = document.getElementById("final-cards-tab");
@@ -163,6 +177,8 @@ function cardElement(card) {
   const article = document.createElement("article");
   article.id = `card-${card.id}`;
   article.className = `card ${card.status === "error" ? "error" : ""}`;
+  article.tabIndex = -1;
+  if (card.topic_id) article.dataset.topicId = card.topic_id;
 
   const header = document.createElement("header");
   const title = document.createElement("h2");
@@ -183,11 +199,55 @@ function cardElement(card) {
   return article;
 }
 
+function outlineList(topics, parentId) {
+  const list = document.createElement("ol");
+  for (const topic of topics.filter(item => item.parent_id === parentId)) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = topic.title;
+    button.addEventListener("click", () => showTopic(topic.id));
+    const summary = document.createElement("p");
+    summary.className = "outline-summary";
+    summary.textContent = topic.summary;
+    item.append(button, summary);
+    const children = topics.filter(child => child.parent_id === topic.id);
+    if (children.length) item.append(outlineList(topics, topic.id));
+    list.append(item);
+  }
+  return list;
+}
+
+function renderOutline() {
+  outline.textContent = "";
+  outlineSection.hidden = !INITIAL_TOPICS.length;
+  if (INITIAL_TOPICS.length) outline.append(outlineList(INITIAL_TOPICS, null));
+}
+
+function showTopic(topicId) {
+  let view = "live";
+  if (finalCards.some(card => card.topic_id === topicId)) view = "final";
+  selectCardView(view, true);
+  requestAnimationFrame(() => {
+    const card = root.querySelector(`[data-topic-id="${CSS.escape(topicId)}"]`);
+    if (!card) return;
+    card.scrollIntoView({behavior: "smooth", block: "start"});
+    card.focus({preventScroll: true});
+  });
+}
+
 function render(cards, reset = false) {
   const atBottom = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 80;
   if (reset) {
     root.textContent = "";
     versions.clear();
+  }
+  const currentIds = new Set(cards.map(card => card.id));
+  for (const existing of root.querySelectorAll(":scope > .card")) {
+    const cardId = existing.id.replace(/^card-/, "");
+    if (currentIds.has(cardId)) continue;
+    existing.remove();
+    versions.delete(cardId);
   }
   if (!cards.length && !root.querySelector(".empty")) {
     const empty = document.createElement("p");
@@ -304,6 +364,7 @@ if (CARDS_ENABLED && INITIAL_CARDS === null) {
     selectCardView("final");
   } else selectCardView("live");
 } else cardsSection.hidden = true;
+renderOutline();
 </script>
 </body>
 </html>
@@ -314,6 +375,7 @@ def viewer_page(
     cards: list[Card] | None = None,
     *,
     final_cards: list[Card] | None = None,
+    topics: list[Topic] | None = None,
     cards_enabled: bool = True,
     transcript_enabled: bool = True,
 ) -> str:
@@ -324,7 +386,11 @@ def viewer_page(
         "const TRANSCRIPT_ENABLED = true;",
         f"const TRANSCRIPT_ENABLED = {str(transcript_enabled).lower()};",
     )
-    for name, initial in (("INITIAL_CARDS", cards), ("INITIAL_FINAL_CARDS", final_cards)):
+    for name, initial in (
+        ("INITIAL_CARDS", cards),
+        ("INITIAL_FINAL_CARDS", final_cards),
+        ("INITIAL_TOPICS", topics),
+    ):
         if initial is None:
             continue
         serialized = json.dumps(
@@ -337,7 +403,10 @@ def viewer_page(
             .replace("\u2028", "\\u2028")
             .replace("\u2029", "\\u2029")
         )
-        page = page.replace(f"const {name} = null;", f"const {name} = {serialized};")
+        marker = f"const {name} = null;"
+        if name == "INITIAL_TOPICS":
+            marker = "const INITIAL_TOPICS = [];"
+        page = page.replace(marker, f"const {name} = {serialized};")
     return page
 
 
@@ -346,11 +415,13 @@ def export_cards(
     output_path: Path,
     *,
     final_cards: list[Card] | None = None,
+    topics: list[Topic] | None = None,
 ) -> Path:
     output_path.write_text(
         viewer_page(
             cards,
             final_cards=final_cards,
+            topics=topics,
             transcript_enabled=False,
         ),
         encoding="utf-8",
@@ -413,9 +484,9 @@ class ViewerServer:
                             body = final_cards_file.read_bytes()
                         except FileNotFoundError:
                             body = b"[]"
-                    self._send(200, "application/json; charset=utf-8", body)
                     if final_cards_file is not None and final_cards_file.exists():
                         final_cards_served.set()
+                    self._send(200, "application/json; charset=utf-8", body)
                     return
                 self._send(404, "text/plain; charset=utf-8", "Not found".encode())
 

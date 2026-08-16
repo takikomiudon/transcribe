@@ -31,6 +31,21 @@ from pathlib import Path
 from typing import Any
 
 import ai
+from card_compiler import (
+    compile_final_knowledge,
+    knowledge_path,
+    outline_path,
+    save_compilation,
+)
+from card_renderer import render_cards
+from transcript_segments import (
+    BatchTranscript,
+    batch_transcript_from_payload,
+    load_segments,
+    save_segments,
+    segment_transcript,
+    segments_path,
+)
 from cards import (
     CARD_CHARACTER_THRESHOLD,
     CARD_IDLE_SECONDS,
@@ -38,7 +53,7 @@ from cards import (
     Card,
     CardGenerationError,
     CardPipeline,
-    generate_final_cards,
+    reconcile_live_cards,
     save_cards,
 )
 from viewer import ViewerServer, export_cards, final_cards_path
@@ -56,6 +71,7 @@ CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MILLISECONDS // 1_000
 UPLOAD_CHUNK_MILLISECONDS = 100
 UPLOAD_CHUNK_BYTES = SAMPLE_RATE * 2 * UPLOAD_CHUNK_MILLISECONDS // 1_000
 FINAL_WAIT_SECONDS = 5
+BATCH_TIMEOUT_SECONDS = 600
 BATCH_REFRESH_SECONDS = 30
 GLOSSARY_WINDOW_SECONDS = 60
 FINAL_REFRESH_GROWTH = 1.5
@@ -439,7 +455,9 @@ def extract_glossary(
     return list(dict.fromkeys(term.strip() for term in terms if term.strip()))[:30]
 
 
-def batch_transcribe(audio_path: Path, api_key: str, curl: str) -> str:
+def batch_transcribe_with_words(
+    audio_path: Path, api_key: str, curl: str
+) -> BatchTranscript:
     try:
         result = subprocess.run(
             [
@@ -454,7 +472,7 @@ def batch_transcribe(audio_path: Path, api_key: str, curl: str) -> str:
                 "--form",
                 f"model_id={BATCH_MODEL}",
                 "--form",
-                "timestamps_granularity=none",
+                "timestamps_granularity=word",
                 "--form",
                 "tag_audio_events=false",
                 BATCH_TRANSCRIPTION_URL,
@@ -463,7 +481,12 @@ def batch_transcribe(audio_path: Path, api_key: str, curl: str) -> str:
             capture_output=True,
             text=True,
             check=False,
+            timeout=BATCH_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired as error:
+        raise BatchTranscriptionError(
+            "ElevenLabs一括文字起こしがタイムアウトしました。"
+        ) from error
     except OSError as error:
         raise BatchTranscriptionError(
             f"ElevenLabs一括文字起こしとの通信に失敗しました: {error}"
@@ -479,12 +502,16 @@ def batch_transcribe(audio_path: Path, api_key: str, curl: str) -> str:
         raise BatchTranscriptionError(
             "ElevenLabs一括文字起こしから不正なJSONを受信しました。"
         ) from error
-    text = payload.get("text") if isinstance(payload, dict) else None
-    if not isinstance(text, str):
+    try:
+        return batch_transcript_from_payload(payload)
+    except ValueError as error:
         raise BatchTranscriptionError(
             "ElevenLabs一括文字起こしの応答にtextがありません。"
-        )
-    return text.strip()
+        ) from error
+
+
+def batch_transcribe(audio_path: Path, api_key: str, curl: str) -> str:
+    return batch_transcribe_with_words(audio_path, api_key, curl).text
 
 
 def should_refresh_final(last_frames: int, current_frames: int) -> bool:
@@ -676,15 +703,25 @@ def finalize_recording(
     api_key: str,
     curl: str,
 ) -> tuple[Path, str]:
-    text = batch_transcribe(audio_path, api_key, curl)
-    output_path = write_batch_transcript(realtime_path, text)
+    transcript = batch_transcribe_with_words(audio_path, api_key, curl)
+    output_path = write_batch_transcript(realtime_path, transcript.text)
+    try:
+        save_segments(
+            segments_path(realtime_path),
+            realtime_path.stem,
+            segment_transcript(transcript),
+        )
+    except OSError as error:
+        raise BatchTranscriptionError(
+            f"根拠セグメントを保存できませんでした: {error}"
+        ) from error
     try:
         audio_path.unlink()
     except OSError as error:
         raise BatchTranscriptionError(
             f"録音を削除できませんでした: {error}"
         ) from error
-    return output_path, text
+    return output_path, transcript.text
 
 
 def response_output_text(
@@ -1220,15 +1257,32 @@ def main(argv: list[str] | None = None) -> int:
                 f"{cards_html_path.suffix}.final.tmp"
             )
             try:
-                final_cards = generate_final_cards(final_text, openai_api_key)
+                evidence_segments = load_segments(segments_path(output_path))
+                compilation = compile_final_knowledge(
+                    evidence_segments, openai_api_key
+                )
+                save_compilation(
+                    compilation,
+                    output_path.stem,
+                    outline_path(cards_json_path),
+                    knowledge_path(cards_json_path),
+                )
+                final_cards = render_cards(
+                    compilation.topics,
+                    compilation.units,
+                    evidence_segments,
+                )
                 live_cards = [
                     Card(**value)
                     for value in json.loads(cards_json_path.read_text(encoding="utf-8"))
                 ]
+                live_cards = reconcile_live_cards(live_cards, final_cards)
+                save_cards(live_cards, cards_json_path)
                 export_cards(
                     live_cards,
                     temporary_html,
                     final_cards=final_cards,
+                    topics=compilation.topics,
                 )
                 quality_path = final_cards_path(cards_json_path)
                 save_cards(final_cards, quality_path)

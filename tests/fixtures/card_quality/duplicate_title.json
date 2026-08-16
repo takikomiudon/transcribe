@@ -1,0 +1,25 @@
+{
+  "case": "exact title duplication",
+  "segments": [
+    {
+      "id": "seg-0001",
+      "raw_text": "小さく試すと失敗の費用を抑えられます。"
+    },
+    {
+      "id": "seg-0002",
+      "raw_text": "小さな試行は学習も早めます。"
+    }
+  ],
+  "cards": [
+    {
+      "title": "小さく試す価値",
+      "html": "<div class=\"callout\"><p>失敗の費用を抑える。</p></div>",
+      "evidence_segment_ids": ["seg-0001"]
+    },
+    {
+      "title": " 小さく 試す価値 ",
+      "html": "<div class=\"callout\"><p>学習を早める。</p></div>",
+      "evidence_segment_ids": ["seg-0002"]
+    }
+  ]
+}

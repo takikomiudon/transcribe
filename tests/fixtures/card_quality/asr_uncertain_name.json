@@ -1,0 +1,16 @@
+{
+  "case": "uncertain ASR proper noun shown as verified",
+  "segments": [
+    {
+      "id": "seg-0001",
+      "raw_text": "ここではクバネティスという仕組みを使います。"
+    }
+  ],
+  "cards": [
+    {
+      "title": "Kubernetesを使う",
+      "html": "<div class=\"keyvalue\"><div class=\"keyvalue-item\"><span class=\"key\">基盤</span><span class=\"value\">Kubernetes</span></div></div>",
+      "evidence_segment_ids": ["seg-0001"]
+    }
+  ]
+}

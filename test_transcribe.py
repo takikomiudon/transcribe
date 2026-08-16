@@ -21,8 +21,11 @@ from urllib.parse import parse_qs, urlparse
 from unittest.mock import MagicMock, patch
 
 import ai
+import card_compiler
+import card_models
 from cards import Card, CardGenerationError
 import transcribe
+import transcript_segments
 
 
 def test_model_configuration() -> None:
@@ -141,17 +144,39 @@ def test_transcript_correction_configuration_and_fallback() -> None:
 def test_batch_transcription_request_and_output() -> None:
     result = SimpleNamespace(
         returncode=0,
-        stdout=json.dumps({"text": "Final transcript."}),
+        stdout=json.dumps(
+            {
+                "text": "Final transcript.",
+                "words": [
+                    {
+                        "text": "Final",
+                        "start": 0.0,
+                        "end": 0.5,
+                        "type": "word",
+                        "speaker_id": "speaker_0",
+                    }
+                ],
+            }
+        ),
         stderr="",
     )
     with patch("transcribe.subprocess.run", return_value=result) as run:
-        text = transcribe.batch_transcribe(
+        transcript = transcribe.batch_transcribe_with_words(
             Path("recordings/session.wav"),
             "secret-key",
             "/usr/bin/curl",
         )
 
-    assert text == "Final transcript."
+    assert transcript.text == "Final transcript."
+    assert transcript.words[0] == transcript_segments.TranscriptWord(
+        id="word-000001",
+        text="Final",
+        start_ms=0,
+        end_ms=500,
+        speaker_id="speaker_0",
+        logprob=None,
+        kind="word",
+    )
     command = run.call_args.args[0]
     assert command == [
         "/usr/bin/curl",
@@ -165,7 +190,7 @@ def test_batch_transcription_request_and_output() -> None:
         "--form",
         "model_id=scribe_v2",
         "--form",
-        "timestamps_granularity=none",
+        "timestamps_granularity=word",
         "--form",
         "tag_audio_events=false",
         "https://api.elevenlabs.io/v1/speech-to-text",
@@ -176,7 +201,15 @@ def test_batch_transcription_request_and_output() -> None:
         "capture_output": True,
         "text": True,
         "check": False,
+        "timeout": transcribe.BATCH_TIMEOUT_SECONDS,
     }
+
+    with patch("transcribe.subprocess.run", return_value=result):
+        assert transcribe.batch_transcribe(
+            Path("recordings/session.wav"),
+            "secret-key",
+            "/usr/bin/curl",
+        ) == "Final transcript."
 
 
 def test_batch_transcription_errors_are_user_facing() -> None:
@@ -668,9 +701,15 @@ def test_completed_batch_is_saved_before_recording_is_deleted() -> None:
         realtime_path = Path(directory) / "20260804-120000.md"
         audio_path = Path(directory) / "20260804-120000.wav"
         audio_path.write_bytes(b"audio")
-        with patch(
-            "transcribe.batch_transcribe", return_value="Final transcript."
-        ):
+        batch = transcript_segments.BatchTranscript(
+            text="Final transcript.",
+            words=[
+                transcript_segments.TranscriptWord(
+                    "word-000001", "Final transcript.", 0, 1_000
+                )
+            ],
+        )
+        with patch("transcribe.batch_transcribe_with_words", return_value=batch):
             final_path, final_text = transcribe.finalize_recording(
                 realtime_path,
                 audio_path,
@@ -681,6 +720,13 @@ def test_completed_batch_is_saved_before_recording_is_deleted() -> None:
         assert final_path == Path(directory) / "20260804-120000-final.md"
         assert final_text == "Final transcript."
         assert "Final transcript." in final_path.read_text(encoding="utf-8")
+        segments = json.loads(
+            (Path(directory) / "20260804-120000-segments.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert segments["schema_version"] == 2
+        assert segments["items"][0]["start_ms"] == 0
         assert not audio_path.exists()
 
 
@@ -690,7 +736,7 @@ def test_batch_or_save_failure_preserves_recording() -> None:
         audio_path = Path(directory) / "20260804-120000.wav"
         audio_path.write_bytes(b"audio")
         with patch(
-            "transcribe.batch_transcribe",
+            "transcribe.batch_transcribe_with_words",
             side_effect=transcribe.BatchTranscriptionError("API failed"),
         ):
             try:
@@ -709,7 +755,12 @@ def test_batch_or_save_failure_preserves_recording() -> None:
         final_path = Path(directory) / "20260804-120000-final.md"
         final_path.write_text("existing", encoding="utf-8")
         with (
-            patch("transcribe.batch_transcribe", return_value="Final transcript."),
+            patch(
+                "transcribe.batch_transcribe_with_words",
+                return_value=transcript_segments.BatchTranscript(
+                    "Final transcript.", []
+                ),
+            ),
             patch(
                 "transcribe.Path.replace",
                 side_effect=OSError("disk failed"),
@@ -738,7 +789,10 @@ def test_final_transcript_replaces_previous_checkpoint() -> None:
         audio_path.write_bytes(b"audio")
         final_path.write_text("old checkpoint", encoding="utf-8")
         with patch(
-            "transcribe.batch_transcribe", return_value="Complete transcript."
+            "transcribe.batch_transcribe_with_words",
+            return_value=transcript_segments.BatchTranscript(
+                "Complete transcript.", []
+            ),
         ):
             transcribe.finalize_recording(
                 realtime_path,
@@ -1001,6 +1055,29 @@ def test_final_cards_replace_live_artifacts_only_on_success() -> None:
             1,
             "done",
         )
+        evidence = transcript_segments.TranscriptSegment(
+            "seg-0001",
+            "Accurate final transcript.",
+            "Accurate final transcript.",
+            0,
+            1_000,
+            ["word-000001"],
+        )
+        topic = card_models.Topic(
+            "topic-0001", "Final topic", "Summary", [evidence.id]
+        )
+        unit = card_models.KnowledgeUnit(
+            "unit-0001",
+            topic.id,
+            "claim",
+            "Final card",
+            "Accurate",
+            [],
+            [evidence.id],
+        )
+        compilation = card_compiler.CompilationResult(
+            [topic], [unit], [], []
+        )
 
         for error in (None, CardGenerationError("failed")):
             live_json = json.dumps([asdict(live_card)])
@@ -1041,26 +1118,40 @@ def test_final_cards_replace_live_artifacts_only_on_success() -> None:
                     return_value=(final_path, "Accurate final transcript."),
                 ),
                 patch(
-                    "transcribe.generate_final_cards",
+                    "transcribe.load_segments",
+                    return_value=[evidence],
+                ),
+                patch(
+                    "transcribe.compile_final_knowledge",
                     side_effect=error,
-                    return_value=[quality_card],
-                ) as generate,
+                    return_value=compilation,
+                ) as compile_final,
+                patch(
+                    "transcribe.render_cards", return_value=[quality_card]
+                ) as render,
                 redirect_stderr(stderr),
             ):
                 assert transcribe.main(["--device", "0", "--cards"]) == 0
 
-            generate.assert_called_once_with(
-                "Accurate final transcript.", "openai-key"
+            compile_final.assert_called_once_with(
+                [evidence], "openai-key"
             )
             if error is None:
-                assert cards_path.read_text(encoding="utf-8") == live_json
+                render.assert_called_once_with([topic], [unit], [evidence])
+                reconciled_live = json.loads(cards_path.read_text(encoding="utf-8"))
+                assert reconciled_live[0]["reconciliation_history"] == [
+                    {"action": "drop", "final_card_ids": []}
+                ]
                 assert json.loads(
                     final_cards_path.read_text(encoding="utf-8")
                 )[0]["title"] == "Final card"
                 assert "Live card" in html_path.read_text(encoding="utf-8")
                 assert "Final card" in html_path.read_text(encoding="utf-8")
+                assert (root / "cards-outline.json").is_file()
+                assert (root / "cards-knowledge.json").is_file()
                 viewer_server.wait_for_final_cards.assert_called_once_with()
             else:
+                render.assert_not_called()
                 assert cards_path.read_text(encoding="utf-8") == live_json
                 assert not final_cards_path.exists()
                 assert html_path.read_text(encoding="utf-8") == "live html"

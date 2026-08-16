@@ -1,0 +1,25 @@
+{
+  "case": "same central claim split across chunks",
+  "segments": [
+    {
+      "id": "seg-0001",
+      "raw_text": "まず行動すると、必要な情報が見えるようになります。"
+    },
+    {
+      "id": "seg-0002",
+      "raw_text": "得た情報を使うと、次の行動の精度が上がります。"
+    }
+  ],
+  "cards": [
+    {
+      "title": "行動が情報を生む",
+      "html": "<div class=\"callout\"><p>行動により必要な情報が見える。</p></div>",
+      "evidence_segment_ids": ["seg-0001"]
+    },
+    {
+      "title": "情報が次の行動を改善する",
+      "html": "<div class=\"callout\"><p>情報が次の行動の精度を上げる。</p></div>",
+      "evidence_segment_ids": ["seg-0002"]
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "case": "parallel alternatives rendered as a flow",
+  "segments": [
+    {
+      "id": "seg-0001",
+      "raw_text": "選択肢は自社開発、外部委託、既製品の3つで、順番はありません。"
+    }
+  ],
+  "cards": [
+    {
+      "title": "3つの実装方法",
+      "html": "<div class=\"flow\"><div class=\"flow-step\">自社開発</div><div class=\"flow-step\">外部委託</div><div class=\"flow-step\">既製品</div></div>",
+      "evidence_segment_ids": ["seg-0001"]
+    }
+  ]
+}

@@ -10,6 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from cards import Card
+from card_models import Topic
 import viewer
 
 
@@ -114,6 +115,7 @@ def test_viewer_page_behavior_and_export() -> None:
     assert "source.textContent = card.source_text" in page
     assert "const atBottom" in page
     assert "existing.replaceWith(element)" in page
+    assert "versions.delete" in page
     assert 'role="tablist"' in page
     assert 'role="tab"' in page
     assert 'role="tabpanel"' in page
@@ -124,6 +126,8 @@ def test_viewer_page_behavior_and_export() -> None:
     assert 'tab.addEventListener("click"' in page
     assert "if (!finalReady && cards.length)" in page
     assert 'selectCardView("final")' in page
+    assert "renderOutline" in page
+    assert "showTopic" in page
     for component in ("flow", "compare", "tree", "timeline", "keyvalue", "callout"):
         assert f".{component}" in page
 
@@ -133,10 +137,22 @@ def test_viewer_page_behavior_and_export() -> None:
     final_card = sample_card()
     final_card.id = "final-card"
     final_card.title = "Final title"
+    final_card.topic_id = "topic-0001"
+    topics = [
+        Topic("topic-0001", "章", "章の概要", ["seg-0001"], order=0),
+        Topic(
+            "topic-0002",
+            "節",
+            "節の概要",
+            ["seg-0002"],
+            parent_id="topic-0001",
+            order=1,
+        ),
+    ]
     with tempfile.TemporaryDirectory() as directory:
         output_path = Path(directory) / "export.html"
         assert viewer.export_cards(
-            [live_card], output_path, final_cards=[final_card]
+            [live_card], output_path, final_cards=[final_card], topics=topics
         ) == output_path
         exported = output_path.read_text(encoding="utf-8")
 
@@ -145,6 +161,8 @@ def test_viewer_page_behavior_and_export() -> None:
     assert "const TRANSCRIPT_ENABLED = false;" in exported
     assert "\\u003c/script>" in exported
     assert "Final title" in exported
+    assert "章の概要" in exported
+    assert 'const INITIAL_TOPICS = [' in exported
     assert "if (CARDS_ENABLED && INITIAL_CARDS === null)" in exported
 
 

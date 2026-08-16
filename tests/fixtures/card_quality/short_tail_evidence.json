@@ -1,0 +1,20 @@
+{
+  "case": "detailed card cites only a short trailing fragment",
+  "segments": [
+    {
+      "id": "seg-0001",
+      "raw_text": "調査、試作、検証の3段階を順番に進めると判断材料が増えます。"
+    },
+    {
+      "id": "seg-0002",
+      "raw_text": "にたどり着いていきます。"
+    }
+  ],
+  "cards": [
+    {
+      "title": "判断材料を増やす3段階",
+      "html": "<div class=\"flow\"><div class=\"flow-step\">調査</div><div class=\"flow-step\">試作</div><div class=\"flow-step\">検証</div></div>",
+      "evidence_segment_ids": ["seg-0002"]
+    }
+  ]
+}
