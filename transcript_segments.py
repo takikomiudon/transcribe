@@ -148,6 +148,16 @@ def _merge_short_segments(segments: list[TranscriptSegment]) -> list[TranscriptS
             merged.append(segment)
             continue
         previous = merged[-1]
+        if (
+            previous.speaker_id is not None
+            and segment.speaker_id is not None
+            and previous.speaker_id != segment.speaker_id
+        ):
+            merged.append(segment)
+            continue
+        end_ms = previous.end_ms
+        if segment.end_ms is not None:
+            end_ms = segment.end_ms
         merged[-1] = TranscriptSegment(
             id=previous.id,
             raw_text=previous.raw_text + segment.raw_text,
@@ -155,7 +165,7 @@ def _merge_short_segments(segments: list[TranscriptSegment]) -> list[TranscriptS
                 previous.normalized_text + segment.normalized_text
             ),
             start_ms=previous.start_ms,
-            end_ms=segment.end_ms,
+            end_ms=end_ms,
             word_ids=[*previous.word_ids, *segment.word_ids],
             speaker_id=previous.speaker_id,
             uncertain_spans=[*previous.uncertain_spans, *segment.uncertain_spans],

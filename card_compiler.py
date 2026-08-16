@@ -406,12 +406,20 @@ def _compile_outline(
     }
     uncovered = [segment.id for segment in segments if segment.id not in covered]
     if uncovered:
-        drafts["未分類"] = {
-            "title": "未分類",
-            "summary": "アウトラインに含まれなかった発話",
-            "segment_ids": uncovered,
-            "parent_title": "",
-        }
+        uncategorized_key = _normalized_title("未分類")
+        if uncategorized_key in drafts:
+            drafts[uncategorized_key]["segment_ids"] = list(
+                dict.fromkeys(
+                    [*drafts[uncategorized_key]["segment_ids"], *uncovered]
+                )
+            )
+        else:
+            drafts[uncategorized_key] = {
+                "title": "未分類",
+                "summary": "アウトラインに含まれなかった発話",
+                "segment_ids": uncovered,
+                "parent_title": "",
+            }
     ordered = sorted(
         drafts.values(),
         key=lambda draft: min(segment_order[id] for id in draft["segment_ids"]),

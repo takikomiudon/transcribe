@@ -105,6 +105,70 @@ def test_segments_follow_sentence_gap_and_speaker_boundaries() -> None:
     assert len({segment.id for segment in segments}) == len(segments)
 
 
+def test_short_segment_keeps_a_different_speaker_boundary() -> None:
+    transcript = evidence.batch_transcript_from_payload(
+        {
+            "text": "詳しい説明を続けます。はい。",
+            "words": [
+                {
+                    "text": "詳しい説明を続けます。",
+                    "start": 0.0,
+                    "end": 1.0,
+                    "type": "word",
+                    "speaker_id": "speaker_0",
+                },
+                {
+                    "text": "はい。",
+                    "start": 1.1,
+                    "end": 1.3,
+                    "type": "word",
+                    "speaker_id": "speaker_1",
+                },
+            ],
+        }
+    )
+
+    segments = evidence.segment_transcript(transcript)
+
+    assert [segment.raw_text for segment in segments] == [
+        "詳しい説明を続けます。",
+        "はい。",
+    ]
+    assert [segment.speaker_id for segment in segments] == [
+        "speaker_0",
+        "speaker_1",
+    ]
+
+
+def test_short_segment_without_end_keeps_previous_end() -> None:
+    transcript = evidence.batch_transcript_from_payload(
+        {
+            "text": "詳しい説明を続けます。はい。",
+            "words": [
+                {
+                    "text": "詳しい説明を続けます。",
+                    "start": 0.0,
+                    "end": 1.0,
+                    "type": "word",
+                    "speaker_id": "speaker_0",
+                },
+                {
+                    "text": "はい。",
+                    "start": 1.1,
+                    "end": None,
+                    "type": "word",
+                    "speaker_id": "speaker_0",
+                },
+            ],
+        }
+    )
+
+    segments = evidence.segment_transcript(transcript)
+
+    assert len(segments) == 1
+    assert segments[0].end_ms == 1_000
+
+
 def test_plain_text_fallback_has_stable_untimed_evidence() -> None:
     transcript = evidence.batch_transcript_from_payload(
         {"text": "時刻のない最終文字起こしです。"}

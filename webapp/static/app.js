@@ -508,9 +508,17 @@ async function startLocalRecorder() {
   state.recorder = recorder;
   try {
     await recorder.start();
+    if (state.recorder !== recorder) {
+      await recorder.stop();
+      return;
+    }
     startRequested = false;
     renderHeader();
   } catch (recorderStartError) {
+    if (state.recorder !== recorder) {
+      await recorder.stop();
+      return;
+    }
     if (!(recorderStartError instanceof Error)) throw recorderStartError;
     state.recorder = null;
     startRequested = false;
@@ -901,7 +909,11 @@ function renderModelSelector(session, recording, finalizing) {
     return;
   }
   const forcedToLuna = session.ai_provider === "deepseek" && isDeepSeekPeakTime();
-  const value = modelKey(forcedToLuna ? state.defaultModel : session);
+  let selectedModel = state.defaultModel;
+  if (!forcedToLuna) {
+    selectedModel = {provider: session.ai_provider, model: session.ai_model};
+  }
+  const value = modelKey(selectedModel);
   if ([...select.options].some(option => option.value === value)) select.value = value;
   select.disabled = session.has_audio || recording || finalizing || startRequested || forcedToLuna;
 }

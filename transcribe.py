@@ -398,7 +398,7 @@ def correct_transcript(
         urllib.error.URLError,
         OSError,
         TimeoutError,
-        json.JSONDecodeError,
+        ValueError,
     ) as error:
         print(f"[補正] 警告: {error}", file=sys.stderr, flush=True)
         return text
@@ -903,8 +903,35 @@ async def process_corrections(
             )
             await finalize_text(corrected)
             context = "\n".join(filter(None, (context, corrected)))[-500:]
+        except Exception as error:
+            print(
+                f"[補正] 警告: 発話を処理できません: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
         finally:
             queue.task_done()
+
+
+async def finish_correction_worker(
+    queue: asyncio.Queue[str | None], worker: asyncio.Task[None]
+) -> None:
+    join_task = asyncio.create_task(queue.join())
+    done, _ = await asyncio.wait(
+        {join_task, worker}, return_when=asyncio.FIRST_COMPLETED
+    )
+    if worker not in done:
+        queue.put_nowait(None)
+        await asyncio.wait({worker})
+    if not join_task.done():
+        join_task.cancel()
+        await asyncio.gather(join_task, return_exceptions=True)
+    if worker.cancelled():
+        print("[補正] 警告: 補正ワーカーがキャンセルされました。", file=sys.stderr)
+        return
+    error = worker.exception()
+    if error is not None:
+        print(f"[補正] 警告: 補正ワーカーが停止しました: {error}", file=sys.stderr)
 
 
 async def stop_process(process: asyncio.subprocess.Process | None) -> None:
@@ -1042,9 +1069,17 @@ async def run_transcription(
                             )
                     if not translate_to_ja:
                         return
-                    translated = await asyncio.to_thread(
-                        translate_to_japanese, text, openai_api_key
-                    )
+                    try:
+                        translated = await asyncio.to_thread(
+                            translate_to_japanese, text, openai_api_key
+                        )
+                    except (TranslationError, OSError) as error:
+                        print(
+                            f"[翻訳] 警告: 日本語訳を生成できません: {error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        return
                     if translated == text:
                         return
                     quote = translated.replace("\n", "\n> ")
@@ -1117,9 +1152,9 @@ async def run_transcription(
                     if not receiver.done():
                         receiver.cancel()
                         await asyncio.gather(receiver, return_exceptions=True)
-                    await correction_queue.join()
-                    correction_queue.put_nowait(None)
-                    await correction_task
+                    await finish_correction_worker(
+                        correction_queue, correction_task
+                    )
 
                 await refresh_task
 

@@ -77,6 +77,26 @@ def test_post_get_and_list_roundtrip() -> None:
         ]
 
 
+def test_host_and_mutating_origin_validation() -> None:
+    with api_client() as (client, _):
+        assert client.get("/", headers={"host": "attacker.example"}).status_code == 400
+        assert (
+            client.post(
+                "/api/sessions",
+                headers={"origin": "https://attacker.example"},
+            ).status_code
+            == 403
+        )
+        assert (
+            client.post(
+                "/api/sessions",
+                headers={"origin": "http://127.0.0.1:8770"},
+            ).status_code
+            == 201
+        )
+        assert client.post("/api/sessions").status_code == 201
+
+
 def test_config_lists_only_configured_models() -> None:
     with api_client() as (client, _):
         payload = client.get("/api/config").json()
@@ -385,6 +405,20 @@ def test_delete_active_session_returns_409() -> None:
         app.state.registry.release()
 
 
+def test_delete_finalizing_session_returns_409_until_finished() -> None:
+    with api_client() as (client, root):
+        id = client.post("/api/sessions").json()["id"]
+        app.state.finalizing[id] = object()
+
+        blocked = client.delete(f"/api/sessions/{id}")
+        app.state.finalizing.pop(id)
+
+        assert blocked.status_code == 409
+        assert "再処理中" in blocked.json()["detail"]
+        assert (root / f"sessions/{id}.json").exists()
+        assert client.delete(f"/api/sessions/{id}").status_code == 204
+
+
 def test_status_reports_idle_and_active_session() -> None:
     with api_client() as (client, _):
         assert app.state.finalizing is app.state.registry.finalizing
@@ -499,6 +533,7 @@ def test_lifespan_rejects_missing_api_keys_and_curl() -> None:
 
 def main() -> None:
     test_post_get_and_list_roundtrip()
+    test_host_and_mutating_origin_validation()
     test_detail_reads_transcripts_and_cards()
     test_patch_rename_and_reject_blank_title()
     test_unknown_session_returns_404()
@@ -506,6 +541,7 @@ def main() -> None:
     test_finalize_session_rejects_recording_missing_audio_and_duplicate()
     test_delete_removes_manifest_and_related_files()
     test_delete_active_session_returns_409()
+    test_delete_finalizing_session_returns_409_until_finished()
     test_status_reports_idle_and_active_session()
     test_audio_returns_wav_or_404()
     test_export_returns_self_contained_html()

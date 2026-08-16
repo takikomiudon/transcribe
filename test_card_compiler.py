@@ -181,6 +181,38 @@ def test_outline_and_topic_failures_fall_back_without_losing_segments() -> None:
     assert len(result.warnings) == 2
 
 
+def test_uncategorized_outline_topic_gains_uncovered_segments() -> None:
+    segments = [
+        segment("seg-0001", "未分類として抽出された十分に長い説明です。", 0),
+        segment("seg-0002", "アウトラインから漏れた十分に長い説明です。", 1_100),
+    ]
+
+    def generate(
+        payload: dict[str, Any], _: str, __: ai.AIModel
+    ) -> dict[str, Any]:
+        if payload["text"]["format"]["name"] == "topic_outline":
+            return {
+                "topics": [
+                    {
+                        "title": "未分類",
+                        "summary": "モデルが付けた話題",
+                        "segment_ids": ["seg-0001"],
+                        "parent_title": "",
+                    }
+                ]
+            }
+        return {"units": []}
+
+    result = card_compiler.compile_final_knowledge(
+        segments, "api-key", generator=generate
+    )
+
+    assert len(result.topics) == 1
+    assert result.topics[0].title == "未分類"
+    assert result.topics[0].summary == "モデルが付けた話題"
+    assert result.topics[0].segment_ids == ["seg-0001", "seg-0002"]
+
+
 def test_topic_knowledge_extraction_runs_in_parallel() -> None:
     segments = [
         segment("seg-0001", "第一の話題について十分に長い根拠を説明します。", 0),

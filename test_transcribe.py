@@ -128,7 +128,11 @@ def test_transcript_correction_configuration_and_fallback() -> None:
     }
     assert urlopen.call_args.kwargs["timeout"] == 10
 
-    for error in (TimeoutError("slow"), urllib.error.URLError("offline")):
+    for error in (
+        TimeoutError("slow"),
+        urllib.error.URLError("offline"),
+        ValueError("invalid response"),
+    ):
         stderr = io.StringIO()
         with (
             patch("transcribe.urllib.request.urlopen", side_effect=error),
@@ -694,6 +698,66 @@ async def test_correction_worker_preserves_original_and_order() -> None:
     assert written == ["first-corrected", "second-corrected", "third-corrected"]
     assert calls[1][1] == "first-corrected"
     assert len(calls[2][1]) <= 500
+
+
+async def test_correction_worker_continues_after_item_failures() -> None:
+    attempted: list[str] = []
+    written: list[str] = []
+
+    def correct(
+        text: str,
+        _: str,
+        __: list[str],
+        ___: str,
+        ____: object,
+    ) -> str:
+        attempted.append(text)
+        if text == "補正失敗":
+            raise RuntimeError("補正処理エラー")
+        return f"補正:{text}"
+
+    async def finalize(text: str) -> None:
+        if text == "補正:保存失敗":
+            raise OSError("保存処理エラー")
+        written.append(text)
+
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    stderr = io.StringIO()
+    with (
+        patch("transcribe.correct_transcript", side_effect=correct),
+        redirect_stderr(stderr),
+    ):
+        worker = asyncio.create_task(
+            transcribe.process_corrections(queue, [], "openai-key", finalize)
+        )
+        for text in ("補正失敗", "保存失敗", "成功"):
+            queue.put_nowait(text)
+        queue.put_nowait(None)
+        await asyncio.wait_for(queue.join(), timeout=0.1)
+        await worker
+
+    assert attempted == ["補正失敗", "保存失敗", "成功"]
+    assert written == ["補正:成功"]
+    assert stderr.getvalue().count("[補正] 警告:") == 2
+
+
+async def test_correction_shutdown_completes_when_worker_has_errored() -> None:
+    async def fail() -> None:
+        raise RuntimeError("worker failed")
+
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    queue.put_nowait("未処理")
+    worker = asyncio.create_task(fail())
+    await asyncio.sleep(0)
+    stderr = io.StringIO()
+
+    with redirect_stderr(stderr):
+        await asyncio.wait_for(
+            transcribe.finish_correction_worker(queue, worker), timeout=0.1
+        )
+
+    assert worker.done()
+    assert "worker failed" in stderr.getvalue()
 
 
 def test_completed_batch_is_saved_before_recording_is_deleted() -> None:
@@ -1513,6 +1577,8 @@ def main() -> None:
     asyncio.run(test_periodic_batch_refresh_uses_growth_and_tail_windows())
     asyncio.run(test_periodic_batch_skips_tail_without_glossary())
     asyncio.run(test_correction_worker_preserves_original_and_order())
+    asyncio.run(test_correction_worker_continues_after_item_failures())
+    asyncio.run(test_correction_shutdown_completes_when_worker_has_errored())
     test_completed_batch_is_saved_before_recording_is_deleted()
     test_batch_or_save_failure_preserves_recording()
     test_final_transcript_replaces_previous_checkpoint()

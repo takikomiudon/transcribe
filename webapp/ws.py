@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import urllib.parse
 from collections.abc import Callable
 from typing import Any
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from websockets.exceptions import WebSocketException
 
 import ai
@@ -21,6 +22,10 @@ from webapp.store import Session
 
 
 router = APIRouter()
+
+
+def is_local_origin(origin: str) -> bool:
+    return urllib.parse.urlsplit(origin).hostname in ("localhost", "127.0.0.1")
 
 
 class WebSocketHub:
@@ -72,6 +77,10 @@ class WebSocketHub:
 
 @router.websocket("/api/sessions/{id}/ws")
 async def session_websocket(websocket: WebSocket, id: str) -> None:
+    origin = websocket.headers.get("origin")
+    if origin is not None and not is_local_origin(origin):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
     state = websocket.app.state
     hub: WebSocketHub = state.hub
     await hub.connect(id, websocket)

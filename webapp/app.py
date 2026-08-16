@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 
@@ -31,7 +32,7 @@ from webapp.config import (
 )
 from webapp.store import Session, SessionStore
 from webapp.runner import RunnerRegistry, SessionFinalizer, run_finalizer
-from webapp.ws import WebSocketHub, router as websocket_router
+from webapp.ws import WebSocketHub, is_local_origin, router as websocket_router
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -78,6 +79,28 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Transcribe", lifespan=lifespan)
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["127.0.0.1", "localhost", "testserver"],
+    www_redirect=False,
+)
+
+
+@app.middleware("http")
+async def validate_mutating_origin(request: Request, call_next: Any) -> Response:
+    origin = request.headers.get("origin")
+    if (
+        request.method in {"POST", "DELETE", "PATCH"}
+        and origin is not None
+        and not is_local_origin(origin)
+    ):
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"detail": "ローカル以外のOriginからの操作は許可されていません。"},
+        )
+    return await call_next(request)
+
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.include_router(websocket_router)
 
@@ -203,10 +226,16 @@ def select_model(
 @app.delete("/api/sessions/{id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_session(id: str, request: Request) -> Response:
     _session(request, id)
-    if request.app.state.registry.active_session_id == id:
+    state = request.app.state
+    if state.registry.active_session_id == id:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="録音中のセッションは削除できません。",
+        )
+    if id in state.finalizing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="再処理中のセッションは削除できません。",
         )
     _store(request).delete(id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

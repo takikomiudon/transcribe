@@ -11,7 +11,7 @@ import pytest
 
 
 class FakeResponse:
-    def __init__(self, payload: dict[str, object]) -> None:
+    def __init__(self, payload: object) -> None:
         self.payload = payload
 
     def __enter__(self) -> FakeResponse:
@@ -134,6 +134,34 @@ def test_deepseek_response_text_rejects_null_content() -> None:
             },
             ai.DEEPSEEK_FLASH_MODEL,
         )
+
+
+@pytest.mark.parametrize(
+    ("response", "model"),
+    [
+        ({"choices": [None]}, ai.DEEPSEEK_FLASH_MODEL),
+        ({"choices": ["invalid"]}, ai.DEEPSEEK_FLASH_MODEL),
+        ({"choices": [{"message": None}]}, ai.DEEPSEEK_FLASH_MODEL),
+        ({"output": ["invalid"]}, ai.DEFAULT_AI_MODEL),
+        (
+            {"output": [{"type": "message", "content": None}]},
+            ai.DEFAULT_AI_MODEL,
+        ),
+    ],
+)
+def test_response_text_rejects_malformed_shapes(
+    response: dict[str, object], model: ai.AIModel
+) -> None:
+    with pytest.raises(ValueError, match="AIから不正な応答を受信しました。"):
+        ai.response_text(response, model)
+
+
+def test_request_rejects_non_object_response() -> None:
+    with (
+        patch("ai.urllib.request.urlopen", return_value=FakeResponse([])),
+        pytest.raises(ValueError, match="AIから不正なJSONを受信しました。"),
+    ):
+        ai.request({"input": "test"}, "openai-key", 10)
 
 
 def test_strip_code_fence() -> None:

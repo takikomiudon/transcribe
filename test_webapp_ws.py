@@ -11,7 +11,9 @@ import wave
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 import ai
 import card_compiler
@@ -680,6 +682,26 @@ def test_websocket_ping_pong() -> None:
                 assert websocket.receive_json() == {"type": "pong"}
 
 
+def test_websocket_rejects_foreign_origin_and_allows_no_origin() -> None:
+    environment = {
+        "TRANSCRIBE_WEBAPP_ROOT": tempfile.mkdtemp(),
+        "ELEVENLABS_API_KEY": "test-elevenlabs-key",
+        "OPENAI_API_KEY": "test-openai-key",
+    }
+    with patch.dict(os.environ, environment), TestClient(app) as client:
+        id = client.post("/api/sessions").json()["id"]
+        with pytest.raises(WebSocketDisconnect) as rejected:
+            with client.websocket_connect(
+                f"/api/sessions/{id}/ws",
+                headers={"origin": "https://attacker.example"},
+            ):
+                pass
+        assert rejected.value.code == 1008
+
+        with client.websocket_connect(f"/api/sessions/{id}/ws") as websocket:
+            assert websocket.receive_json()["type"] == "status"
+
+
 def test_websocket_start_uses_saved_model() -> None:
     captured: dict[str, object] = {}
 
@@ -799,6 +821,7 @@ def main() -> None:
     asyncio.run(test_runner_title_falls_back_to_realtime_transcript())
     test_card_store_attach_reuses_paths_and_cards()
     test_websocket_ping_pong()
+    test_websocket_rejects_foreign_origin_and_allows_no_origin()
     test_websocket_start_uses_saved_model()
     test_websocket_explicit_stop_requests_finalization()
     test_websocket_rejects_start_while_reprocessing()

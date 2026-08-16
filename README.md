@@ -85,7 +85,7 @@ uv run -m webapp
 
 Webアプリではセッション履歴を残し、録音の開始・停止・同じセッションへの再開ができます。録音したWAVは最終処理後も常に保持し、削除する場合はセッションメニューから明示的に操作します。
 
-録音開始前はヘッダーのAIモデル選択から `GPT-5.6 Luna` と `DeepSeek V4 Flash` をセッション単位で切り替えられます。新規セッションの既定値はOpenAI `gpt-5.6-luna`です。`DEEPSEEK_API_KEY` を設定した場合だけ、公式APIの `deepseek-v4-flash` が選択肢に表示されます。録音開始後はモデルを変更できず、停止後に再開しても録音開始時のモデルを使います。
+録音開始前はヘッダーのAIモデル選択から `GPT-5.6 Luna` と `DeepSeek V4 Flash` をセッション単位で切り替えられます。新規セッションの既定値はOpenAI `gpt-5.6-luna`です。`DEEPSEEK_API_KEY` を設定した場合だけ、公式APIの `deepseek-v4-flash` が選択肢に表示されます。録音開始後は保存されたモデル選択を変更できず、停止後に再開しても同じ選択を使います。ただしDeepSeekを選択したセッションでも、UTC 1:00〜4:00・6:00〜10:00（JST 10:00〜13:00・15:00〜19:00）は各AI処理の直前にOpenAI `gpt-5.6-luna`へ切り替わり、その時間帯の処理にはOpenAIの利用料金が発生します。保存されたモデル選択はDeepSeekのままです。
 
 CLIはWebアプリから独立しており、従来どおり `uv run transcribe.py` で利用できます。CLIはstdlibとwebsocketsだけを使う方針を維持します。WebアプリはFastAPIとuvicornを使用し、依存は `pyproject.toml` で管理します。
 
