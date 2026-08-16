@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import threading
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -379,13 +381,14 @@ def viewer_page(
     cards_enabled: bool = True,
     transcript_enabled: bool = True,
 ) -> str:
-    page = VIEWER_HTML.replace(
-        "const CARDS_ENABLED = true;",
-        f"const CARDS_ENABLED = {str(cards_enabled).lower()};",
-    ).replace(
-        "const TRANSCRIPT_ENABLED = true;",
-        f"const TRANSCRIPT_ENABLED = {str(transcript_enabled).lower()};",
-    )
+    replacements = {
+        "const CARDS_ENABLED = true;": (
+            f"const CARDS_ENABLED = {str(cards_enabled).lower()};"
+        ),
+        "const TRANSCRIPT_ENABLED = true;": (
+            f"const TRANSCRIPT_ENABLED = {str(transcript_enabled).lower()};"
+        ),
+    }
     for name, initial in (
         ("INITIAL_CARDS", cards),
         ("INITIAL_FINAL_CARDS", final_cards),
@@ -406,8 +409,12 @@ def viewer_page(
         marker = f"const {name} = null;"
         if name == "INITIAL_TOPICS":
             marker = "const INITIAL_TOPICS = [];"
-        page = page.replace(marker, f"const {name} = {serialized};")
-    return page
+        replacements[marker] = f"const {name} = {serialized};"
+    markers = re.compile("|".join(re.escape(marker) for marker in replacements))
+    return markers.sub(
+        lambda match: replacements[match.group(0)],
+        VIEWER_HTML,
+    )
 
 
 def export_cards(
@@ -417,15 +424,24 @@ def export_cards(
     final_cards: list[Card] | None = None,
     topics: list[Topic] | None = None,
 ) -> Path:
-    output_path.write_text(
-        viewer_page(
-            cards,
-            final_cards=final_cards,
-            topics=topics,
-            transcript_enabled=False,
-        ),
-        encoding="utf-8",
-    )
+    temporary = output_path.with_suffix(f"{output_path.suffix}.tmp")
+    try:
+        temporary.write_text(
+            viewer_page(
+                cards,
+                final_cards=final_cards,
+                topics=topics,
+                transcript_enabled=False,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(temporary, output_path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return output_path
 
 

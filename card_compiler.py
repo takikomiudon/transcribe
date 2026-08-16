@@ -695,9 +695,10 @@ def _merge_by_groups(
 def _merge_exact_titles(
     units: list[KnowledgeUnit], merge_log: list[str]
 ) -> list[KnowledgeUnit]:
-    title_groups: dict[str, list[str]] = {}
+    title_groups: dict[tuple[str, str, str], list[str]] = {}
     for unit in units:
-        title_groups.setdefault(_normalized_title(unit.title), []).append(unit.id)
+        key = (unit.topic_id, unit.kind, _normalized_title(unit.title))
+        title_groups.setdefault(key, []).append(unit.id)
     groups = [ids for ids in title_groups.values() if len(ids) > 1]
     return _merge_by_groups(units, groups, merge_log, "exact title")
 
@@ -767,7 +768,7 @@ def compile_final_knowledge(
     by_id = {segment.id: segment for segment in segments}
     units: list[KnowledgeUnit] = []
     next_index = 1
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [
             executor.submit(
                 generator,

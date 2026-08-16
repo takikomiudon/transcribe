@@ -104,8 +104,7 @@ class TranslationError(TranscriptionError):
 class TranscriptReducer:
     """Reduce ElevenLabs partial and committed transcript events."""
 
-    def __init__(self, write_final: Callable[[str], None]) -> None:
-        self.write_final = write_final
+    def __init__(self) -> None:
         self.partial = ""
         self.commits_received = 0
         self.ready: deque[str] = deque()
@@ -121,7 +120,6 @@ class TranscriptReducer:
             self.commits_received += 1
             self.partial = ""
             if text:
-                self.write_final(text)
                 self.ready.append(text)
             return text, True
 
@@ -515,7 +513,9 @@ def batch_transcribe(audio_path: Path, api_key: str, curl: str) -> str:
 
 
 def should_refresh_final(last_frames: int, current_frames: int) -> bool:
-    return last_frames == 0 or current_frames >= last_frames * FINAL_REFRESH_GROWTH
+    return current_frames > 0 and (
+        last_frames == 0 or current_frames >= last_frames * FINAL_REFRESH_GROWTH
+    )
 
 
 def merge_glossary(
@@ -524,7 +524,9 @@ def merge_glossary(
     return list(dict.fromkeys([*new_terms, *existing]))[:limit]
 
 
-def snapshot_recording(recording: Any, audio_file: Any, audio_path: Path) -> Path:
+async def snapshot_recording(
+    recording: Any, audio_file: Any, audio_path: Path
+) -> Path:
     """Copy the complete frames written so far into a valid temporary WAV."""
     snapshot: Path | None = None
     try:
@@ -532,8 +534,8 @@ def snapshot_recording(recording: Any, audio_file: Any, audio_path: Path) -> Pat
         audio_file.flush()
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
             snapshot = Path(temporary.name)
-        shutil.copyfile(audio_path, snapshot)
-    except OSError as error:
+        await asyncio.to_thread(shutil.copyfile, audio_path, snapshot)
+    except (OSError, AttributeError, ValueError) as error:
         if snapshot is not None:
             try:
                 snapshot.unlink(missing_ok=True)
@@ -545,13 +547,7 @@ def snapshot_recording(recording: Any, audio_file: Any, audio_path: Path) -> Pat
     return snapshot
 
 
-def snapshot_recording_tail(
-    recording: Any,
-    audio_file: Any,
-    audio_path: Path,
-    seconds: float,
-) -> Path:
-    snapshot = snapshot_recording(recording, audio_file, audio_path)
+def _snapshot_recording_tail_file(snapshot: Path, seconds: float) -> Path:
     tail: Path | None = None
     try:
         with wave.open(str(snapshot), "rb") as source:
@@ -574,13 +570,28 @@ def snapshot_recording_tail(
             output.writeframes(frames)
         snapshot.unlink()
         return tail
+    except (OSError, EOFError, wave.Error):
+        if tail is not None:
+            tail.unlink(missing_ok=True)
+        raise
+
+
+async def snapshot_recording_tail(
+    recording: Any,
+    audio_file: Any,
+    audio_path: Path,
+    seconds: float,
+) -> Path:
+    snapshot = await snapshot_recording(recording, audio_file, audio_path)
+    try:
+        return await asyncio.to_thread(
+            _snapshot_recording_tail_file, snapshot, seconds
+        )
     except (OSError, EOFError, wave.Error) as error:
-        for path in (tail, snapshot):
-            if path is not None:
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+        try:
+            snapshot.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise BatchTranscriptionError(
             f"録音中のWAV末尾スナップショットを作成できませんでした: {error}"
         ) from error
@@ -642,13 +653,15 @@ async def periodically_refresh_final(
 
         current_frames = recording.tell()
         refresh_final = should_refresh_final(last_full_frames, current_frames)
-        if refresh_final or glossary is not None:
+        if current_frames > 0 and (refresh_final or glossary is not None):
             snapshot: Path | None = None
             try:
                 if refresh_final:
-                    snapshot = snapshot_recording(recording, audio_file, audio_path)
+                    snapshot = await snapshot_recording(
+                        recording, audio_file, audio_path
+                    )
                 else:
-                    snapshot = snapshot_recording_tail(
+                    snapshot = await snapshot_recording_tail(
                         recording,
                         audio_file,
                         audio_path,
@@ -795,10 +808,22 @@ async def stream_audio(
             )
         )
 
+    async def consume(audio: bytes) -> None:
+        nonlocal has_audio
+        if not audio:
+            return
+        record_audio(audio)
+        has_audio = True
+        upload_buffer.extend(audio)
+        while len(upload_buffer) >= UPLOAD_CHUNK_BYTES:
+            await send_audio(bytes(upload_buffer[:UPLOAD_CHUNK_BYTES]))
+            del upload_buffer[:UPLOAD_CHUNK_BYTES]
+
     while not stop_event.is_set():
         try:
             chunk = await process.stdout.readexactly(CHUNK_BYTES)
-        except asyncio.IncompleteReadError:
+        except asyncio.IncompleteReadError as error:
+            await consume(error.partial)
             if stop_event.is_set():
                 break
             stderr = b""
@@ -806,12 +831,10 @@ async def stream_audio(
                 stderr = await process.stderr.read()
             detail = stderr.decode(errors="replace").strip()
             raise CaptureError(detail or "音声入力が終了しました。")
-        record_audio(chunk)
-        has_audio = True
-        upload_buffer.extend(chunk)
-        while len(upload_buffer) >= UPLOAD_CHUNK_BYTES:
-            await send_audio(bytes(upload_buffer[:UPLOAD_CHUNK_BYTES]))
-            del upload_buffer[:UPLOAD_CHUNK_BYTES]
+        await consume(chunk)
+
+    if stop_event.is_set():
+        await consume(await process.stdout.read())
 
     if not has_audio:
         return False
@@ -945,6 +968,26 @@ async def stop_process(process: asyncio.subprocess.Process | None) -> None:
         await process.wait()
 
 
+async def _await_refresh_task(
+    task: asyncio.Task[None], forced_stop: asyncio.Event
+) -> None:
+    try:
+        await task
+    except asyncio.CancelledError:
+        if not forced_stop.is_set():
+            print(
+                "[batch] 警告: final更新タスクがキャンセルされました。",
+                file=sys.stderr,
+                flush=True,
+            )
+    except Exception as error:
+        print(
+            f"[batch] 警告: final更新タスクを終了できません: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 async def run_transcription(
     device: int,
     elevenlabs_api_key: str,
@@ -965,15 +1008,32 @@ async def run_transcription(
         raise TranscriptionError("`uv run transcribe.py` で起動してください。") from error
 
     stop_event = asyncio.Event()
+    forced_stop = asyncio.Event()
     progress_changed = asyncio.Event()
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGINT, stop_event.set)
     process: asyncio.subprocess.Process | None = None
     tasks: list[asyncio.Task[Any]] = []
     refresh_task: asyncio.Task[None] | None = None
+    correction_task: asyncio.Task[None] | None = None
     pipeline: CardPipeline | None = None
     viewer_server: ViewerServer | None = None
     keep_viewer_open = False
+
+    def handle_sigint() -> None:
+        if not stop_event.is_set():
+            print(
+                "停止処理中です。もう一度Ctrl-Cで即時終了します。",
+                file=sys.stderr,
+                flush=True,
+            )
+            stop_event.set()
+            return
+        forced_stop.set()
+        for task in (refresh_task, correction_task):
+            if task is not None and not task.done():
+                task.cancel()
+
+    loop.add_signal_handler(signal.SIGINT, handle_sigint)
 
     if cards_enabled:
         try:
@@ -1101,7 +1161,7 @@ async def run_transcription(
                     )
                 )
 
-                reducer = TranscriptReducer(lambda _: None)
+                reducer = TranscriptReducer()
                 sender = asyncio.create_task(
                     stream_audio(
                         websocket,
@@ -1156,7 +1216,8 @@ async def run_transcription(
                         correction_queue, correction_task
                     )
 
-                await refresh_task
+                await _await_refresh_task(refresh_task, forced_stop)
+                refresh_task = None
 
             keep_viewer_open = viewer_server is not None
             return (
@@ -1184,8 +1245,8 @@ async def run_transcription(
         ) from error
     finally:
         stop_event.set()
-        if refresh_task is not None and not refresh_task.done():
-            await refresh_task
+        if refresh_task is not None:
+            await _await_refresh_task(refresh_task, forced_stop)
         for task in tasks:
             if not task.done():
                 task.cancel()

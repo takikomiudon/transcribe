@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 from cards import Card
 from card_models import Topic
@@ -170,6 +172,37 @@ def test_final_cards_path() -> None:
     assert viewer.final_cards_path(Path("cards/session.json")) == Path(
         "cards/session-final.json"
     )
+
+
+def test_viewer_page_does_not_rescan_injected_marker_text() -> None:
+    live = sample_card()
+    live.title = "const INITIAL_FINAL_CARDS = null;"
+    final = sample_card()
+    final.id = "final-card"
+
+    page = viewer.viewer_page([live], final_cards=[final])
+
+    assert page.count("const INITIAL_FINAL_CARDS = [") == 1
+    assert json.dumps(live.title, ensure_ascii=False) in page
+
+
+def test_export_cards_replaces_only_complete_temporary_file() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "cards.html"
+        real_replace = os.replace
+        replacements: list[str] = []
+
+        def checked_replace(source: str | Path, destination: str | Path) -> None:
+            replacements.append(Path(source).read_text(encoding="utf-8"))
+            real_replace(source, destination)
+
+        with patch("viewer.os.replace", side_effect=checked_replace):
+            viewer.export_cards([sample_card()], output)
+
+        assert len(replacements) == 1
+        assert replacements[0].startswith("<!doctype html>")
+        assert output.read_text(encoding="utf-8") == replacements[0]
+        assert not output.with_suffix(".html.tmp").exists()
 
 
 def main() -> None:

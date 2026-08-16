@@ -70,8 +70,26 @@ def test_kind_to_component_mapping_and_html_are_deterministic() -> None:
     assert all(card.created_at == 0 for card in first)
     assert any("&lt;unsafe&gt;" in card.html for card in first)
     assert all("<unsafe>" not in card.html for card in first)
+    assert all("の要約 &lt;unsafe&gt;" in card.html for card in first[:4])
+    assert [card.summary for card in first] == [
+        knowledge.title + "の要約 <unsafe>" for knowledge in units
+    ]
     assert "<h3>" not in first[0].html
     assert 'class="flow"' in first[0].html
+
+
+def test_items_less_component_keeps_summary_without_empty_wrapper() -> None:
+    topic = card_models.Topic(
+        "topic-0001", "話題", "概要", ["seg-0001"]
+    )
+    comparison = unit("unit-0001", "comparison", "比較結果", [])
+
+    card = card_renderer.render_cards(
+        [topic], [comparison], [segment("seg-0001", "根拠")]
+    )[0]
+
+    assert "比較結果の要約 &lt;unsafe&gt;" in card.html
+    assert 'class="compare"' not in card.html
 
 
 def test_examples_fold_into_parent_and_source_comes_from_segments() -> None:

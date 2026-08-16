@@ -8,6 +8,8 @@ import io
 import inspect
 import json
 import os
+import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -18,12 +20,13 @@ from dataclasses import asdict
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from urllib.parse import parse_qs, urlparse
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import ai
 import card_compiler
 import card_models
 from cards import Card, CardGenerationError
+import pytest
 import transcribe
 import transcript_segments
 
@@ -241,7 +244,7 @@ def test_batch_transcription_errors_are_user_facing() -> None:
                 raise AssertionError("BatchTranscriptionError was not raised")
 
 
-def test_recording_snapshot_is_a_complete_wav() -> None:
+async def test_recording_snapshot_is_a_complete_wav() -> None:
     first = bytes(transcribe.CHUNK_BYTES)
     second = bytes([1]) * transcribe.CHUNK_BYTES
     with tempfile.TemporaryDirectory() as directory:
@@ -255,9 +258,12 @@ def test_recording_snapshot_is_a_complete_wav() -> None:
             recording.setframerate(transcribe.SAMPLE_RATE)
             recording.writeframesraw(first)
             recording.writeframesraw(second)
-            snapshot = transcribe.snapshot_recording(
-                recording, audio_file, audio_path
-            )
+            with patch(
+                "transcribe.asyncio.to_thread", wraps=asyncio.to_thread
+            ) as to_thread:
+                snapshot = await transcribe.snapshot_recording(
+                    recording, audio_file, audio_path
+                )
 
             with wave.open(str(snapshot), "rb") as saved:
                 assert saved.getnchannels() == 1
@@ -266,10 +272,25 @@ def test_recording_snapshot_is_a_complete_wav() -> None:
                 assert saved.readframes(saved.getnframes()) == first + second
 
             snapshot.unlink()
+            assert to_thread.call_args.args[0] is shutil.copyfile
+
+
+async def test_recording_snapshot_wraps_closed_writer_errors() -> None:
+    class ClosedRecording:
+        def writeframes(self, _: bytes) -> None:
+            raise AttributeError("closed wave writer")
+
+    with pytest.raises(
+        transcribe.BatchTranscriptionError, match="スナップショット"
+    ):
+        await transcribe.snapshot_recording(
+            ClosedRecording(), MagicMock(), Path("recording.wav")
+        )
 
 
 def test_batch_refresh_helpers() -> None:
-    assert transcribe.should_refresh_final(0, 0)
+    assert not transcribe.should_refresh_final(0, 0)
+    assert transcribe.should_refresh_final(0, 1)
     assert not transcribe.should_refresh_final(100, 149)
     assert transcribe.should_refresh_final(100, 150)
     assert transcribe.should_refresh_final(100, 151)
@@ -284,7 +305,36 @@ def test_batch_refresh_helpers() -> None:
     ) == ["新出語", "既存語"]
 
 
-def test_recording_tail_snapshot_is_a_valid_wav() -> None:
+async def test_periodic_refresh_skips_zero_frame_recording() -> None:
+    stop_event = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.01, stop_event.set)
+    recording = MagicMock()
+    recording.tell.return_value = 0
+    with (
+        patch(
+            "transcribe.snapshot_recording", new_callable=AsyncMock
+        ) as full_snapshot,
+        patch(
+            "transcribe.snapshot_recording_tail", new_callable=AsyncMock
+        ) as tail_snapshot,
+    ):
+        await transcribe.periodically_refresh_final(
+            Path("session.md"),
+            Path("recording.wav"),
+            recording,
+            object(),
+            "secret-key",
+            "/usr/bin/curl",
+            stop_event,
+            interval_seconds=0.001,
+            glossary=[],
+        )
+
+    full_snapshot.assert_not_called()
+    tail_snapshot.assert_not_called()
+
+
+async def test_recording_tail_snapshot_is_a_valid_wav() -> None:
     frames = b"\x01\x00\x02\x00\x03\x00\x04\x00"
     with tempfile.TemporaryDirectory() as directory:
         audio_path = Path(directory) / "recording.wav"
@@ -297,12 +347,15 @@ def test_recording_tail_snapshot_is_a_valid_wav() -> None:
             recording.setframerate(transcribe.SAMPLE_RATE)
             recording.writeframesraw(frames)
 
-            tail = transcribe.snapshot_recording_tail(
-                recording,
-                audio_file,
-                audio_path,
-                2 / transcribe.SAMPLE_RATE,
-            )
+            with patch(
+                "transcribe.asyncio.to_thread", wraps=asyncio.to_thread
+            ) as to_thread:
+                tail = await transcribe.snapshot_recording_tail(
+                    recording,
+                    audio_file,
+                    audio_path,
+                    2 / transcribe.SAMPLE_RATE,
+                )
             with wave.open(str(tail), "rb") as saved:
                 assert saved.getnchannels() == 1
                 assert saved.getsampwidth() == 2
@@ -310,8 +363,9 @@ def test_recording_tail_snapshot_is_a_valid_wav() -> None:
                 assert saved.getnframes() == 2
                 assert saved.readframes(2) == frames[-4:]
             tail.unlink()
+            assert to_thread.call_count == 2
 
-            complete = transcribe.snapshot_recording_tail(
+            complete = await transcribe.snapshot_recording_tail(
                 recording, audio_file, audio_path, seconds=1
             )
             with wave.open(str(complete), "rb") as saved:
@@ -353,9 +407,13 @@ async def test_periodic_batch_refresh_retries_without_overlap() -> None:
         realtime_path = Path(directory) / "session.md"
         with (
             patch(
-                "transcribe.snapshot_recording", side_effect=make_snapshot
+                "transcribe.snapshot_recording",
+                new_callable=AsyncMock,
+                side_effect=make_snapshot,
             ) as full_snapshot,
-            patch("transcribe.snapshot_recording_tail") as tail_snapshot,
+            patch(
+                "transcribe.snapshot_recording_tail", new_callable=AsyncMock
+            ) as tail_snapshot,
             patch("transcribe.batch_transcribe", side_effect=transcribe_snapshot),
         ):
             await transcribe.periodically_refresh_final(
@@ -397,7 +455,11 @@ async def test_periodic_batch_failure_keeps_previous_final() -> None:
         final_path = transcribe.final_transcript_path(realtime_path)
         final_path.write_text("previous checkpoint", encoding="utf-8")
         with (
-            patch("transcribe.snapshot_recording", return_value=snapshot),
+            patch(
+                "transcribe.snapshot_recording",
+                new_callable=AsyncMock,
+                return_value=snapshot,
+            ),
             patch("transcribe.batch_transcribe", side_effect=fail),
         ):
             await transcribe.periodically_refresh_final(
@@ -458,7 +520,11 @@ async def test_periodic_batch_refresh_updates_correction_glossary() -> None:
     with tempfile.TemporaryDirectory() as directory:
         realtime_path = Path(directory) / "session.md"
         with (
-            patch("transcribe.snapshot_recording", return_value=snapshot),
+            patch(
+                "transcribe.snapshot_recording",
+                new_callable=AsyncMock,
+                return_value=snapshot,
+            ),
             patch("transcribe.batch_transcribe", side_effect=transcribe_snapshot),
             patch(
                 "transcribe.urllib.request.urlopen", return_value=response
@@ -538,10 +604,14 @@ async def test_periodic_batch_refresh_uses_growth_and_tail_windows() -> None:
         final_path = transcribe.final_transcript_path(realtime_path)
         with (
             patch(
-                "transcribe.snapshot_recording", side_effect=make_snapshot
+                "transcribe.snapshot_recording",
+                new_callable=AsyncMock,
+                side_effect=make_snapshot,
             ) as full_snapshot,
             patch(
-                "transcribe.snapshot_recording_tail", side_effect=make_snapshot
+                "transcribe.snapshot_recording_tail",
+                new_callable=AsyncMock,
+                side_effect=make_snapshot,
             ) as tail_snapshot,
             patch("transcribe.batch_transcribe", side_effect=transcribe_snapshot),
             patch(
@@ -615,8 +685,14 @@ async def test_periodic_batch_skips_tail_without_glossary() -> None:
     recording.tell.side_effect = current_frames
     with tempfile.TemporaryDirectory() as directory:
         with (
-            patch("transcribe.snapshot_recording", side_effect=make_snapshot),
-            patch("transcribe.snapshot_recording_tail") as tail_snapshot,
+            patch(
+                "transcribe.snapshot_recording",
+                new_callable=AsyncMock,
+                side_effect=make_snapshot,
+            ),
+            patch(
+                "transcribe.snapshot_recording_tail", new_callable=AsyncMock
+            ) as tail_snapshot,
             patch("transcribe.batch_transcribe", side_effect=transcribe_snapshot),
         ):
             await transcribe.periodically_refresh_final(
@@ -758,6 +834,20 @@ async def test_correction_shutdown_completes_when_worker_has_errored() -> None:
 
     assert worker.done()
     assert "worker failed" in stderr.getvalue()
+
+
+async def test_refresh_task_failure_is_logged_without_propagating() -> None:
+    async def fail_refresh() -> None:
+        raise AttributeError("closed wave writer")
+
+    stderr = io.StringIO()
+    with redirect_stderr(stderr):
+        await transcribe._await_refresh_task(
+            asyncio.create_task(fail_refresh()), asyncio.Event()
+        )
+
+    assert "final更新タスク" in stderr.getvalue()
+    assert "closed wave writer" in stderr.getvalue()
 
 
 def test_completed_batch_is_saved_before_recording_is_deleted() -> None:
@@ -973,6 +1063,9 @@ async def test_all_audio_is_streamed_in_batches_and_committed_on_stop() -> None:
             stop_event.set()
             raise asyncio.IncompleteReadError(partial=b"", expected=expected)
 
+        async def read(self, _: int = -1) -> bytes:
+            return b""
+
     class FakeProcess:
         stdout = SilenceStdout()
         stderr = None
@@ -1006,9 +1099,50 @@ async def test_all_audio_is_streamed_in_batches_and_committed_on_stop() -> None:
     assert recorded == bytes(transcribe.CHUNK_BYTES * 11)
 
 
+async def test_stream_audio_keeps_partial_and_drains_on_stop() -> None:
+    stop_event = asyncio.Event()
+    partial = b"\x01\x00" * 3
+    remaining = b"\x02\x00" * 2
+
+    class BufferedStdout:
+        async def readexactly(self, expected: int) -> bytes:
+            stop_event.set()
+            raise asyncio.IncompleteReadError(partial=partial, expected=expected)
+
+        async def read(self, _: int = -1) -> bytes:
+            return remaining
+
+    class FakeProcess:
+        stdout = BufferedStdout()
+        stderr = None
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def send(self, message: str) -> None:
+            self.messages.append(message)
+
+    websocket = FakeWebSocket()
+    recorded = bytearray()
+
+    committed = await transcribe.stream_audio(
+        websocket,
+        FakeProcess(),  # type: ignore[arg-type]
+        stop_event,
+        recorded.extend,
+    )
+
+    assert committed
+    assert recorded == partial + remaining
+    assert len(websocket.messages) == 1
+    message = json.loads(websocket.messages[0])
+    assert message["commit"] is True
+    assert base64.b64decode(message["audio_base_64"]) == partial + remaining
+
+
 def test_realtime_events_and_repeated_transcripts() -> None:
-    written: list[str] = []
-    reducer = transcribe.TranscriptReducer(written.append)
+    reducer = transcribe.TranscriptReducer()
 
     assert reducer.handle(
         {"message_type": "partial_transcript", "text": "Hello wor"}
@@ -1019,7 +1153,6 @@ def test_realtime_events_and_repeated_transcripts() -> None:
     assert reducer.handle(
         {"message_type": "committed_transcript", "text": "Hello world"}
     ) == ("Hello world", True)
-    assert written == ["Hello world", "Hello world"]
     assert reducer.take_ready() == ["Hello world", "Hello world"]
     assert reducer.commits_received == 2
 
@@ -1281,9 +1414,15 @@ async def test_websocket_error_preserves_completed_output() -> None:
                 raise StopAsyncIteration from error
 
     written: list[str] = []
-    reducer = transcribe.TranscriptReducer(written.append)
+
+    async def collect(text: str) -> None:
+        written.append(text)
+
+    reducer = transcribe.TranscriptReducer()
     try:
-        await transcribe.receive_events(FakeWebSocket(), reducer, asyncio.Event())
+        await transcribe.receive_events(
+            FakeWebSocket(), reducer, asyncio.Event(), collect
+        )
     except transcribe.RealtimeAPIError as error:
         assert "network failed" in str(error)
     else:
@@ -1308,7 +1447,11 @@ async def test_realtime_text_is_hidden_and_provider_error_events() -> None:
 
     written: list[str] = []
     output = io.StringIO()
-    reducer = transcribe.TranscriptReducer(written.append)
+    reducer = transcribe.TranscriptReducer()
+
+    async def collect(text: str) -> None:
+        written.append(text)
+
     with redirect_stdout(output):
         try:
             await transcribe.receive_events(
@@ -1320,6 +1463,7 @@ async def test_realtime_text_is_hidden_and_provider_error_events() -> None:
                 ),
                 reducer,
                 asyncio.Event(),
+                collect,
             )
         except transcribe.TranscriptionError:
             pass
@@ -1344,7 +1488,7 @@ async def test_realtime_text_is_hidden_and_provider_error_events() -> None:
                         )
                     ]
                 ),
-                transcribe.TranscriptReducer(lambda _: None),
+                transcribe.TranscriptReducer(),
                 asyncio.Event(),
             )
         except transcribe.RealtimeAPIError as error:
@@ -1432,6 +1576,14 @@ async def test_corrected_text_reaches_all_outputs() -> None:
     websockets_module.asyncio = asyncio_module  # type: ignore[attr-defined]
 
     finalized = asyncio.Event()
+    refresh_cancelled = asyncio.Event()
+    signal_handlers: dict[signal.Signals, object] = {}
+
+    async def block_refresh(*_: object, **__: object) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            refresh_cancelled.set()
 
     async def fake_stream(
         _: object,
@@ -1442,7 +1594,11 @@ async def test_corrected_text_reaches_all_outputs() -> None:
         assert callable(record_audio)
         record_audio(bytes(transcribe.CHUNK_BYTES))
         await finalized.wait()
-        stop_event.set()
+        handler = signal_handlers[signal.SIGINT]
+        assert callable(handler)
+        handler()
+        await asyncio.sleep(0.01)
+        handler()
         return False
 
     async def fake_receive(
@@ -1464,6 +1620,14 @@ async def test_corrected_text_reaches_all_outputs() -> None:
         transcript_path = Path(directory) / "transcript.md"
         recording_path = Path(directory) / "recording.wav"
         terminal = io.StringIO()
+        shutdown_errors = io.StringIO()
+        event_loop = asyncio.get_running_loop()
+
+        def add_signal_handler(
+            watched_signal: signal.Signals, handler: object
+        ) -> None:
+            signal_handlers[watched_signal] = handler
+
         with (
             patch.dict(
                 sys.modules,
@@ -1483,6 +1647,13 @@ async def test_corrected_text_reaches_all_outputs() -> None:
             ),
             patch("transcribe.stream_audio", fake_stream),
             patch("transcribe.receive_events", fake_receive),
+            patch("transcribe.periodically_refresh_final", block_refresh),
+            patch.object(
+                event_loop,
+                "add_signal_handler",
+                side_effect=add_signal_handler,
+            ),
+            patch.object(event_loop, "remove_signal_handler"),
             patch(
                 "transcribe.transcript_path",
                 return_value=transcript_path,
@@ -1498,6 +1669,7 @@ async def test_corrected_text_reaches_all_outputs() -> None:
                 "transcribe.translate_to_japanese", return_value="日本語訳"
             ) as translate,
             redirect_stdout(terminal),
+            redirect_stderr(shutdown_errors),
         ):
             result = await transcribe.run_transcription(
                 0,
@@ -1533,6 +1705,8 @@ async def test_corrected_text_reaches_all_outputs() -> None:
     assert "日本語訳" in saved
     assert "Corrected text\n" in terminal.getvalue()
     assert "Original text" not in terminal.getvalue()
+    assert refresh_cancelled.is_set()
+    assert "もう一度Ctrl-Cで即時終了します" in shutdown_errors.getvalue()
     assert connect_calls[0][0] == (transcribe.realtime_url(),)
     assert connect_calls[0][1]["additional_headers"] == {
         "xi-api-key": "eleven-key"
@@ -1568,9 +1742,9 @@ def main() -> None:
     test_transcript_correction_configuration_and_fallback()
     test_batch_transcription_request_and_output()
     test_batch_transcription_errors_are_user_facing()
-    test_recording_snapshot_is_a_complete_wav()
+    asyncio.run(test_recording_snapshot_is_a_complete_wav())
     test_batch_refresh_helpers()
-    test_recording_tail_snapshot_is_a_valid_wav()
+    asyncio.run(test_recording_tail_snapshot_is_a_valid_wav())
     asyncio.run(test_periodic_batch_refresh_retries_without_overlap())
     asyncio.run(test_periodic_batch_failure_keeps_previous_final())
     asyncio.run(test_periodic_batch_refresh_updates_correction_glossary())

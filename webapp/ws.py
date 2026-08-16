@@ -62,17 +62,30 @@ class WebSocketHub:
                 self.connections.pop(id, None)
 
     async def broadcast(self, id: str, event: dict[str, Any]) -> None:
-        disconnected: list[WebSocket] = []
-        for websocket in list(self.connections.get(id, ())):
+        if event.get("type") == "status":
+            targets = [
+                (connection_id, websocket)
+                for connection_id, connections in self.connections.items()
+                for websocket in connections
+            ]
+        else:
+            targets = [
+                (id, websocket)
+                for websocket in self.connections.get(id, ())
+            ]
+        disconnected: list[tuple[str, WebSocket]] = []
+        for connection_id, websocket in targets:
             try:
                 await websocket.send_json(event)
             except (OSError, RuntimeError, WebSocketDisconnect):
-                disconnected.append(websocket)
-        for websocket in disconnected:
-            await self.disconnect(id, websocket)
+                disconnected.append((connection_id, websocket))
+        for connection_id, websocket in disconnected:
+            await self.disconnect(connection_id, websocket)
         if event.get("type") == "status" and event.get("state") == "idle":
-            self.recorders.pop(id, None)
-            self.runners.pop(id, None)
+            subject_id = event.get("session_id")
+            if isinstance(subject_id, str):
+                self.recorders.pop(subject_id, None)
+                self.runners.pop(subject_id, None)
 
 
 @router.websocket("/api/sessions/{id}/ws")
@@ -88,6 +101,7 @@ async def session_websocket(websocket: WebSocket, id: str) -> None:
     await websocket.send_json(
         {
             "type": "status",
+            "session_id": active,
             "active_session_id": active,
             "state": "recording" if active is not None else "idle",
         }

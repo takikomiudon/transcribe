@@ -255,20 +255,27 @@ def save_segments(
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(f"{path.suffix}.tmp")
-    temporary.write_text(
-        json.dumps(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "session_id": session_id,
-                "items": [asdict(segment) for segment in segments],
-            },
-            ensure_ascii=False,
-            indent=2,
+    try:
+        temporary.write_text(
+            json.dumps(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "session_id": session_id,
+                    "items": [asdict(segment) for segment in segments],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
         )
-        + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+        temporary.replace(path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def load_segments(path: Path) -> list[TranscriptSegment]:

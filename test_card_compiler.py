@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 from threading import Barrier
 from typing import Any
+from unittest.mock import patch
 
 import ai
 import card_compiler
@@ -263,17 +264,64 @@ def test_topic_knowledge_extraction_runs_in_parallel() -> None:
             ]
         }
 
-    result = card_compiler.compile_final_knowledge(
-        segments,
-        "api-key",
-        generator=generate,
-    )
+    executor = card_compiler.ThreadPoolExecutor
+    worker_counts: list[int | None] = []
+
+    def capture_executor(*args: object, **kwargs: object):
+        worker_counts.append(kwargs.get("max_workers"))
+        return executor(*args, **kwargs)
+
+    with patch("card_compiler.ThreadPoolExecutor", side_effect=capture_executor):
+        result = card_compiler.compile_final_knowledge(
+            segments,
+            "api-key",
+            generator=generate,
+        )
 
     assert [unit.id for unit in result.units] == ["unit-0001", "unit-0002"]
     assert [unit.topic_id for unit in result.units] == [
         "topic-0001",
         "topic-0002",
     ]
+    assert worker_counts == [4]
+
+
+def test_exact_title_merge_keeps_different_topics_and_kinds() -> None:
+    units = [
+        card_models.KnowledgeUnit(
+            "unit-0001",
+            "topic-0001",
+            "claim",
+            "まとめ",
+            "第一章の結論",
+            [],
+            ["seg-0001"],
+        ),
+        card_models.KnowledgeUnit(
+            "unit-0002",
+            "topic-0002",
+            "claim",
+            "まとめ",
+            "第二章の結論",
+            [],
+            ["seg-0002"],
+        ),
+        card_models.KnowledgeUnit(
+            "unit-0003",
+            "topic-0001",
+            "definition",
+            "まとめ",
+            "第一章の定義",
+            [],
+            ["seg-0003"],
+        ),
+    ]
+    merge_log: list[str] = []
+
+    merged = card_compiler._merge_exact_titles(units, merge_log)
+
+    assert merged == units
+    assert merge_log == []
 
 
 def test_structured_artifacts_roundtrip_with_schema_version() -> None:

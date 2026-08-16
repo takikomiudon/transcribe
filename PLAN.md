@@ -1,6 +1,6 @@
 # 図解カード整理基盤 改修計画
 
-> Status: Proposed  
+> Status: Phases 1–4 implemented; Phase 5 proposed
 > 対象リポジトリ: `takikomiudon/transcribe`  
 > 対象ブランチ: `main`  
 > 計画作成時に確認した先頭コミット: `a44f9b450b6ab419a61d8b4b8565383300b9c7f6`  
@@ -625,7 +625,7 @@ batch transcription
 - エラー時に通常カードが追加されないことへ期待値を変更
 - 旧JSONの読込互換テストを追加
 
-#### `test_webapp.py`
+#### `test_webapp_api.py` / `test_webapp_ws.py`
 
 - 旧セッションの読込
 - 新しいoutline/knowledgeファイルがない場合
@@ -662,12 +662,12 @@ batch transcription
 
 作業:
 
-- [ ] word timestampを取得する。
-- [ ] `BatchTranscript`、`TranscriptWord`、`TranscriptSegment`を導入する。
-- [ ] `*-segments.json`を保存する。
-- [ ] 旧文字列APIを壊さない。
-- [ ] セグメントIDから`source_text`を再構成する関数を作る。
-- [ ] フォールバック時は時刻なしセグメントを作る。
+- [x] word timestampを取得する。
+- [x] `BatchTranscript`、`TranscriptWord`、`TranscriptSegment`を導入する。
+- [x] `*-segments.json`を保存する。
+- [x] 旧文字列APIを壊さない。
+- [x] セグメントIDから`source_text`を再構成する関数を作る。
+- [x] フォールバック時は時刻なしセグメントを作る。
 
 完了条件:
 
@@ -682,13 +682,13 @@ batch transcription
 
 作業:
 
-- [ ] アウトライン生成
-- [ ] トピック別`KnowledgeUnit`抽出
-- [ ] 全体統合
-- [ ] 根拠検証
-- [ ] outline/knowledge JSON保存
-- [ ] 品質版生成のフォールバック
-- [ ] LLM応答を厳格なJSON Schemaにする
+- [x] アウトライン生成
+- [x] トピック別`KnowledgeUnit`抽出
+- [x] 全体統合
+- [x] 根拠検証
+- [x] outline/knowledge JSON保存
+- [x] 品質版生成のフォールバック
+- [x] LLM応答を厳格なJSON Schemaにする
 
 完了条件:
 
@@ -704,12 +704,12 @@ batch transcription
 
 作業:
 
-- [ ] `card_renderer.py`を実装
-- [ ] 既存コンポーネントCSSを再利用
-- [ ] `source_text`をサーバー側で再構成
-- [ ] 新しい任意メタデータを保存
-- [ ] 旧カードJSONを読み込めるようにする
-- [ ] エラーカードを廃止
+- [x] `card_renderer.py`を実装
+- [x] 既存コンポーネントCSSを再利用
+- [x] `source_text`をサーバー側で再構成
+- [x] 新しい任意メタデータを保存
+- [x] 旧カードJSONを読み込めるようにする
+- [x] エラーカードを廃止
 
 完了条件:
 
@@ -724,12 +724,12 @@ batch transcription
 
 作業:
 
-- [ ] 概要・目次・カード・全文の表示
-- [ ] トピック別グルーピング
-- [ ] 根拠ハイライト
-- [ ] 音声時刻ジャンプ
-- [ ] `needs_review`表示
-- [ ] オフラインHTMLにも目次を含める
+- [x] 概要・目次・カード・全文の表示
+- [x] トピック別グルーピング
+- [x] 根拠ハイライト
+- [x] 音声時刻ジャンプ
+- [x] `needs_review`表示
+- [x] オフラインHTMLにも目次を含める
 
 完了条件:
 

@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import shutil
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -187,7 +188,7 @@ def get_session(id: str, request: Request) -> dict[str, Any]:
 
 
 @app.patch("/api/sessions/{id}")
-def rename_session(
+async def rename_session(
     id: str, body: RenameRequest, request: Request
 ) -> dict[str, Any]:
     _session(request, id)
@@ -195,7 +196,7 @@ def rename_session(
 
 
 @app.patch("/api/sessions/{id}/model")
-def select_model(
+async def select_model(
     id: str, body: ModelSelectionRequest, request: Request
 ) -> dict[str, Any]:
     session = _session(request, id)
@@ -224,7 +225,7 @@ def select_model(
 
 
 @app.delete("/api/sessions/{id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_session(id: str, request: Request) -> Response:
+async def delete_session(id: str, request: Request) -> Response:
     _session(request, id)
     state = request.app.state
     if state.registry.active_session_id == id:
@@ -265,16 +266,22 @@ async def finalize_session(id: str, request: Request) -> dict[str, str]:
         )
 
     factory = getattr(state, "finalizer_factory", SessionFinalizer)
-    finalizer = factory(
-        session,
-        state.store,
-        state.root,
-        elevenlabs_key=state.elevenlabs_key,
-        openai_key=state.openai_key,
-        deepseek_key=state.deepseek_key,
-        curl_path=state.curl_path,
-        broadcast=lambda event: state.hub.broadcast(id, event),
-    )
+    try:
+        finalizer = factory(
+            session,
+            state.store,
+            state.root,
+            elevenlabs_key=state.elevenlabs_key,
+            openai_key=state.openai_key,
+            deepseek_key=state.deepseek_key,
+            curl_path=state.curl_path,
+            broadcast=lambda event: state.hub.broadcast(id, event),
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"再処理を開始できません: {error}",
+        ) from error
     task = asyncio.create_task(_run_finalizer(request.app, id, finalizer))
     state.finalizing[id] = task
     return {"status": "accepted"}
@@ -361,22 +368,57 @@ def _transcript(path: Path) -> str | None:
         lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
         return None
+    except (OSError, UnicodeError) as error:
+        _warn_unreadable(path, error)
+        return None
     for index, line in enumerate(lines):
         if line.strip() == "## Transcript":
             return "\n".join(lines[index + 1 :]).strip()
+    _warn_unreadable(path, ValueError("Transcript見出しがありません。"))
     return None
 
 
 def _json_list(path: Path) -> list[dict[str, Any]]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return []
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        _warn_unreadable(path, error)
+        return []
+    if not isinstance(value, list) or any(
+        not isinstance(item, dict) for item in value
+    ):
+        _warn_unreadable(path, ValueError("JSON配列の形式が不正です。"))
+        return []
+    return value
 
 
 def _json_items(path: Path) -> list[dict[str, Any]]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
+        items = value["items"]
     except FileNotFoundError:
         return []
-    return value["items"]
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+    ) as error:
+        _warn_unreadable(path, error)
+        return []
+    if not isinstance(items, list) or any(
+        not isinstance(item, dict) for item in items
+    ):
+        _warn_unreadable(path, ValueError("itemsの形式が不正です。"))
+        return []
+    return items
+
+
+def _warn_unreadable(path: Path, error: Exception) -> None:
+    print(
+        f"警告: {path.name}を読み込めないため空として扱います: {error}",
+        file=sys.stderr,
+    )

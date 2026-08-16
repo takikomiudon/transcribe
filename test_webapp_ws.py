@@ -30,6 +30,7 @@ from webapp.runner import (
     SessionRunner,
 )
 from webapp.store import Session, SessionStore
+from webapp.ws import WebSocketHub
 
 
 class FakeElevenLabsWS:
@@ -68,6 +69,14 @@ class FakeElevenLabsWS:
     async def close(self) -> None:
         self.closed = True
         self.incoming.put_nowait(None)
+
+
+class FakeBrowserWebSocket:
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    async def send_json(self, event: dict[str, object]) -> None:
+        self.events.append(event)
 
 
 def fake_correct(
@@ -345,9 +354,208 @@ async def test_runner_stop_releases_before_background_finalizer_finishes() -> No
         assert second_started
         assert first_session.id not in registry.finalizing
         assert finalizing["active_session_id"] is None
+        assert finalizing["session_id"] == first_session.id
         assert [event["state"] for event in states].index("idle") < [
             event["state"] for event in states
         ].index("finalizing")
+
+
+async def test_status_broadcast_is_hub_wide_and_cleans_subject_recorder() -> None:
+    hub = WebSocketHub()
+    first = FakeBrowserWebSocket()
+    second = FakeBrowserWebSocket()
+    recorder = FakeBrowserWebSocket()
+    hub.connections = {"first": {first}, "second": {second}}
+    hub.recorders["first"] = recorder
+    hub.runners["first"] = object()
+
+    status_event = {
+        "type": "status",
+        "session_id": "first",
+        "active_session_id": None,
+        "state": "idle",
+    }
+    await hub.broadcast("second", status_event)
+    await hub.broadcast("first", {"type": "partial", "text": "hello"})
+
+    assert first.events == [
+        status_event,
+        {"type": "partial", "text": "hello"},
+    ]
+    assert second.events == [status_event]
+    assert "first" not in hub.recorders
+    assert "first" not in hub.runners
+
+
+async def test_runner_stop_releases_registry_when_appender_close_fails(
+    capsys,
+) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        ensure_dirs(root)
+        store = SessionStore(root)
+        session = store.create()
+        registry = RunnerRegistry()
+        events: list[dict[str, object]] = []
+        runner = make_runner(
+            session, store, root, registry, FakeElevenLabsWS(), events
+        )
+
+        await runner.start()
+        close = runner.appender.close
+
+        def fail_close() -> None:
+            raise OSError("disk full")
+
+        runner.appender.close = fail_close
+        try:
+            await runner.stop(finalize=False)
+        finally:
+            runner.appender.close = close
+            close()
+
+        assert runner._stopped
+        assert registry.active_session_id is None
+        assert any(
+            event["type"] == "status" and event["state"] == "idle"
+            for event in events
+        )
+        assert "録音ファイルを閉じられませんでした" in capsys.readouterr().err
+
+
+async def test_runner_stop_cancels_watch_task() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        ensure_dirs(root)
+        store = SessionStore(root)
+        session = store.create()
+        runner = make_runner(
+            session, store, root, RunnerRegistry(), FakeElevenLabsWS(), []
+        )
+        await runner.start()
+        assert runner._watch_task is not None
+        runner._watch_task.cancel()
+        await asyncio.gather(runner._watch_task, return_exceptions=True)
+
+        waiting = asyncio.Event()
+
+        async def wait_forever() -> None:
+            waiting.set()
+            await asyncio.Event().wait()
+
+        watch_task = asyncio.create_task(wait_forever())
+        runner._watch_task = watch_task
+        await waiting.wait()
+
+        await runner.stop(finalize=False)
+
+        assert watch_task.cancelled()
+
+
+async def test_abort_start_cancels_created_worker_tasks() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        ensure_dirs(root)
+        store = SessionStore(root)
+        session = store.create()
+        runner = make_runner(
+            session, store, root, RunnerRegistry(), FakeElevenLabsWS(), []
+        )
+        emit_calls = 0
+
+        async def fail_first_session_event() -> None:
+            nonlocal emit_calls
+            emit_calls += 1
+            if emit_calls == 1:
+                raise OSError("late start failure")
+
+        runner._emit_session = fail_first_session_event
+        try:
+            with pytest.raises(OSError, match="late start failure"):
+                await runner.start()
+            tasks = [
+                task
+                for task in (
+                    runner._uplink_task,
+                    runner._receiver_task,
+                    runner._correction_task,
+                    runner._watch_task,
+                    *runner._background_tasks,
+                )
+                if task is not None
+            ]
+            assert tasks
+            assert all(task.done() for task in tasks)
+        finally:
+            tasks = [
+                task
+                for task in (
+                    runner._uplink_task,
+                    runner._receiver_task,
+                    runner._correction_task,
+                    runner._watch_task,
+                    *runner._background_tasks,
+                )
+                if task is not None
+            ]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_correction_stop_task_is_retained_and_logs_failure(capsys) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        ensure_dirs(root)
+        store = SessionStore(root)
+        runner = make_runner(
+            store.create(), store, root, RunnerRegistry(), FakeElevenLabsWS(), []
+        )
+
+        async def fail_finalize(_: int, __: str) -> None:
+            raise OSError("write failed")
+
+        async def fail_stop(*, finalize: bool = True) -> None:
+            raise RuntimeError("stop failed")
+
+        runner._finalize = fail_finalize
+        runner.stop = fail_stop
+        worker = asyncio.create_task(runner._correct())
+        runner.correction_queue.put_nowait((1, "hello"))
+        await runner.correction_queue.join()
+        await wait_until(
+            lambda: runner._stop_task is not None and runner._stop_task.done()
+        )
+        runner.correction_queue.put_nowait(None)
+        await worker
+
+        assert runner._stop_task is not None
+        await asyncio.gather(runner._stop_task, return_exceptions=True)
+        assert "停止処理に失敗しました: stop failed" in capsys.readouterr().err
+
+
+async def test_runner_bounds_audio_queue_and_prunes_partial_tasks(capsys) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        ensure_dirs(root)
+        store = SessionStore(root)
+        runner = make_runner(
+            store.create(), store, root, RunnerRegistry(), FakeElevenLabsWS(), []
+        )
+        runner._accepting_audio = True
+        assert runner.audio_queue.maxsize > 0
+        for _ in range(runner.audio_queue.maxsize):
+            assert runner.feed_audio(b"\x00\x00")
+
+        assert runner.feed_audio(b"\x00\x00") is False
+        assert "音声チャンクを破棄しました" in capsys.readouterr().err
+
+        completed = asyncio.create_task(asyncio.sleep(0))
+        await completed
+        runner._partial_tasks.append(completed)
+        runner._on_partial("partial")
+        assert len(runner._partial_tasks) == 1
+        await asyncio.gather(*runner._partial_tasks)
 
 
 async def test_light_stop_persists_without_finalizing() -> None:
@@ -518,6 +726,7 @@ async def test_session_finalizer_reprocesses_stored_session() -> None:
             "cards",
             "session",
         ]
+        assert events[0]["session_id"] == session.id
         assert saved is not None and saved.finalized
         assert saved.title == "Final title"
         assert live_cards[0]["reconciliation_history"] == [
@@ -808,6 +1017,79 @@ def test_websocket_rejects_start_while_reprocessing() -> None:
                 }
         finally:
             del app.state.finalizing[id]
+
+
+def test_reprocess_status_reaches_other_session_websocket() -> None:
+    class BroadcastingFinalizer:
+        def __init__(
+            self,
+            session: Session,
+            *_: object,
+            broadcast,
+            **__: object,
+        ) -> None:
+            self.session = session
+            self.broadcast = broadcast
+
+        async def run(self) -> None:
+            await self.broadcast(
+                {
+                    "type": "status",
+                    "session_id": self.session.id,
+                    "active_session_id": None,
+                    "state": "finalizing",
+                }
+            )
+
+    environment = {
+        "TRANSCRIBE_WEBAPP_ROOT": tempfile.mkdtemp(),
+        "ELEVENLABS_API_KEY": "test-elevenlabs-key",
+        "OPENAI_API_KEY": "test-openai-key",
+    }
+    with patch.dict(os.environ, environment), TestClient(app) as client:
+        target = client.post("/api/sessions").json()
+        other = client.post("/api/sessions").json()
+        stored = app.state.store.get(target["id"])
+        assert stored is not None
+        stored.has_audio = True
+        app.state.store.save(stored)
+        (app.state.root / stored.paths["audio"]).write_bytes(b"audio")
+        app.state.finalizer_factory = BroadcastingFinalizer
+        try:
+            with (
+                client.websocket_connect(
+                    f"/api/sessions/{target['id']}/ws"
+                ) as target_socket,
+                client.websocket_connect(
+                    f"/api/sessions/{other['id']}/ws"
+                ) as other_socket,
+            ):
+                assert target_socket.receive_json()["type"] == "status"
+                assert other_socket.receive_json()["type"] == "status"
+
+                assert client.post(
+                    f"/api/sessions/{target['id']}/finalize"
+                ).status_code == 202
+                target_events = [
+                    target_socket.receive_json(),
+                    target_socket.receive_json(),
+                ]
+                other_events = [
+                    other_socket.receive_json(),
+                    other_socket.receive_json(),
+                ]
+
+                assert [event["state"] for event in target_events] == [
+                    "finalizing",
+                    "idle",
+                ]
+                assert other_events == target_events
+                assert all(
+                    event["session_id"] == target["id"]
+                    for event in target_events
+                )
+        finally:
+            del app.state.finalizer_factory
 
 
 def main() -> None:

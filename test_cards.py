@@ -51,6 +51,12 @@ def test_sanitize_card_html() -> None:
         '<div class="flow"><p>Hello <strong>world</strong></p>'
         '<span class="label">safe</span></div>'
     )
+    assert cards.sanitize_card_html(
+        "<svg><img></svg><p>after svg</p>"
+    ) == "<p>after svg</p>"
+    assert cards.sanitize_card_html(
+        "<svg></p><p>leaked?</p></svg>rest"
+    ) == "rest"
 
 
 def test_card_generation_payload() -> None:
@@ -268,126 +274,6 @@ def test_deepseek_truncated_card_response_reports_length() -> None:
             )
 
 
-def test_final_card_generation_payload() -> None:
-    payload = cards.final_card_generation_payload("Complete final transcript.")
-
-    assert payload["input"] == "Complete final transcript."
-    assert payload["store"] is False
-    assert "json" in payload["instructions"].lower()
-    assert json.dumps(cards.FINAL_CARDS_JSON_EXAMPLE, ensure_ascii=False) in payload[
-        "instructions"
-    ]
-    output_format = payload["text"]["format"]
-    assert output_format["type"] == "json_schema"
-    assert output_format["strict"] is True
-    item = output_format["schema"]["properties"]["cards"]["items"]
-    assert item["required"] == ["title", "html", "source_text"]
-    assert set(cards.FINAL_CARDS_JSON_EXAMPLE["cards"][0]) == set(
-        item["properties"]
-    )
-
-
-def test_generate_final_cards_parses_and_sanitizes_all_cards() -> None:
-    response_body = {
-        "status": "completed",
-        "output": [
-            {
-                "type": "message",
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": "```json\n"
-                        + json.dumps(
-                            {
-                                "cards": [
-                                    {
-                                        "title": "First",
-                                        "html": (
-                                            '<div class="callout" onclick="bad()">'
-                                            "<p>First</p></div>"
-                                        ),
-                                        "source_text": "Accurate first section.",
-                                    },
-                                    {
-                                        "title": "Second",
-                                        "html": '<div class="flow"><p>Second</p></div>',
-                                        "source_text": "Accurate second section.",
-                                    },
-                                ]
-                            }
-                        )
-                        + "\n```",
-                    }
-                ],
-            }
-        ],
-    }
-
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_: object) -> None:
-            return None
-
-        def read(self) -> bytes:
-            return json.dumps(response_body).encode()
-
-    with patch("cards.urllib.request.urlopen", return_value=FakeResponse()):
-        generated = cards.generate_final_cards("final", "api-key")
-
-    assert [card.title for card in generated] == ["First", "Second"]
-    assert generated[0].html == '<div class="callout"><p>First</p></div>'
-    assert generated[1].source_text == "Accurate second section."
-    assert all(card.status == "done" for card in generated)
-
-
-def test_generate_final_cards_rejects_empty_or_invalid_cards() -> None:
-    class FakeResponse:
-        def __init__(self, result: object) -> None:
-            self.result = result
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_: object) -> None:
-            return None
-
-        def read(self) -> bytes:
-            return json.dumps(
-                {
-                    "status": "completed",
-                    "output": [
-                        {
-                            "type": "message",
-                            "content": [
-                                {
-                                    "type": "output_text",
-                                    "text": json.dumps(self.result),
-                                }
-                            ],
-                        }
-                    ],
-                }
-            ).encode()
-
-    for result in (
-        {"cards": []},
-        {"cards": [{"title": "", "html": "<p>x</p>", "source_text": "x"}]},
-        {"cards": [{"title": "x", "html": "", "source_text": "x"}]},
-        {"cards": [{"title": "x", "html": "<p>x</p>", "source_text": ""}]},
-    ):
-        with patch(
-            "cards.urllib.request.urlopen", return_value=FakeResponse(result)
-        ):
-            try:
-                cards.generate_final_cards("final", "api-key")
-            except cards.CardGenerationError:
-                pass
-            else:
-                raise AssertionError("CardGenerationError was not raised")
-
-
 def test_card_store_replaces_all_cards_atomically() -> None:
     live = cards.Card("live", "Live", "<p>live</p>", "live", 1, "done")
     final = cards.Card("final", "Final", "<p>final</p>", "final", 2, "done")
@@ -549,6 +435,33 @@ def test_old_card_json_uses_new_metadata_defaults() -> None:
     assert card.reconciliation_history == []
 
 
+def test_card_store_attach_drops_unknown_fields(capsys) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        json_path = root / "cards.json"
+        json_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "future",
+                        "title": "Future card",
+                        "html": "<p>body</p>",
+                        "source_text": "source",
+                        "created_at": 1,
+                        "status": "done",
+                        "future_field": "newer version",
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        store = cards.CardStore.attach(json_path, root / "cards.html")
+
+        assert store.snapshot()[0].title == "Future card"
+        assert "future_field" in capsys.readouterr().err
+
+
 async def test_card_pipeline_retries_with_backoff() -> None:
     attempts = 0
 
@@ -607,6 +520,55 @@ async def test_card_pipeline_preserves_order_during_retry() -> None:
 
     assert [card.title for card in result] == ["first", "second"]
     assert attempts == {"first": 3, "second": 1}
+
+
+async def test_card_pipeline_keeps_working_after_decision_persist_failure() -> None:
+    generated: list[str] = []
+
+    def generate(
+        source_text: str,
+        _: str,
+        __: list[dict[str, object]],
+        ___: list[str],
+        ____: ai.AIModel,
+    ) -> dict[str, object]:
+        generated.append(source_text)
+        return {
+            "decision": "create",
+            "card_ids": [],
+            "title": source_text,
+            "html": f"<p>{source_text}</p>",
+            "summary": source_text,
+            "keywords": [source_text],
+        }
+
+    with tempfile.TemporaryDirectory() as directory:
+        pipeline = cards.CardPipeline(
+            "api-key",
+            output_dir=Path(directory),
+            character_threshold=1,
+            retry_base_seconds=0,
+            generator=generate,
+        )
+        persist = pipeline.store._persist
+        persist_calls = 0
+
+        def fail_first_persist() -> None:
+            nonlocal persist_calls
+            persist_calls += 1
+            if persist_calls == 1:
+                raise OSError("disk full")
+            persist()
+
+        pipeline.store._persist = fail_first_persist
+        pipeline.start()
+        pipeline.add("first")
+        pipeline.add("second")
+        result = await pipeline.close()
+
+    assert generated == ["first", "second"]
+    assert [card.title for card in result] == ["first", "second"]
+    assert pipeline.errors == ["disk full"]
 
 
 def test_card_candidates_are_lightweight_and_rank_non_last_match() -> None:
@@ -788,13 +750,13 @@ def test_live_final_reconciliation_history_is_recorded() -> None:
     live = [
         cards.Card(
             "live-1",
-            "Python wheel",
+            "減価償却の計算方法",
             "<p>live</p>",
             "source",
             1,
             "done",
-            summary="Python wheel",
-            keywords=["python", "wheel"],
+            summary="取得価額と耐用年数から各期の費用を求める。",
+            keywords=["定額法", "耐用年数"],
             provisional=True,
         ),
         cards.Card(
@@ -812,7 +774,7 @@ def test_live_final_reconciliation_history_is_recorded() -> None:
     final = [
         cards.Card(
             "final-1",
-            "Python wheel",
+            "減価償却の計算方法",
             "<p>final</p>",
             "source",
             0,
@@ -835,9 +797,6 @@ def main() -> None:
     test_sanitize_card_html()
     test_card_generation_payload()
     test_generate_card_parses_and_sanitizes_response()
-    test_final_card_generation_payload()
-    test_generate_final_cards_parses_and_sanitizes_all_cards()
-    test_generate_final_cards_rejects_empty_or_invalid_cards()
     test_card_store_replaces_all_cards_atomically()
     asyncio.run(test_card_pipeline_applies_decisions_in_order())
     asyncio.run(test_card_pipeline_records_error_after_five_failures())

@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -86,16 +86,6 @@ CARD_SKIP_JSON_EXAMPLE = {
     "summary": "",
     "keywords": [],
 }
-FINAL_CARDS_JSON_EXAMPLE = {
-    "cards": [
-        {
-            "title": "話題のタイトル",
-            "html": '<div class="callout"><p>要点の説明</p></div>',
-            "source_text": "対応する文字起こしの抜粋",
-        }
-    ]
-}
-
 CARD_INSTRUCTIONS = f"""\
 あなたは講義のライブ文字起こしを、コンパクトな日本語の図解カードに変換します。
 新しいテキスト・候補カード・トピック概要を踏まえ、必ず次のいずれか1つを選びます:
@@ -154,53 +144,6 @@ URL, 画像, その他のタグやクラスは決して出力しません。各�
 最終応答はJSONで返し、例と同じフィールドだけを含めます。
 """
 
-FINAL_CARD_INSTRUCTIONS = f"""\
-あなたは講義の完全な最終文字起こしを、コンパクトな日本語の図解カードに
-変換します。まず文字起こし全体を読み、意味のある話題単位に分割します。
-話者が見出しやセクション名を読み上げている場合は、それを話題の区切りの
-手がかりとして使います。カードは文字起こしの出現順に返します。雑談・
-繰り返し・図解に値しない内容はスキップします。各カードには、対応する
-最終文字起こしの該当箇所を source_text にそのまま写します。
-
-HTMLを書く前に、まず内容の論理構造を特定し、それに合致するコンポーネント
-ルートを1つだけ選びます。安易に flow を既定にしてはいけません。
-- flow: 真の系列のみ — 順序そのものに意味がある3段階以上の手順・段階・
-  因果連鎖。判定基準: 箱を並べ替えても意味が変わらないなら flow は誤りです。
-- compare: 2つ以上の選択肢・対比・ビフォーアフター・長所短所・対立する
-  アプローチ。1つの側につき compare-item を1つ使います。
-- tree: 1つの概念が種類・原因・要因・論点に枝分かれするもの
-  (分類や分解で、順序を持たないもの)。
-- timeline: 日付・時代・明示的な時系列に紐づく出来事。
-- keyvalue: 名前付きの事実や数値 — 指標・定義・用語と意味の対。
-  具体的な数値が主役の内容では常に keyvalue を優先します。
-- table: 複数の対象を2つ以上の共通属性で比較するもの。
-- callout: 単一の主張・洞察・結論とその補足。1つの考えだけの内容に
-  適しています — 1つの考えを flow に水増ししてはいけません。
-
-記述ルール:
-- 1つの文を複数の flow-step に分割してはいけません。各ステップは独立した
-  段階を自分の言葉で記述します。
-- flow-step・compare-item・tree-branch の内部では、太字の見出しと説明文を
-  別々の要素(strong の後に p または span)に分け、1行に連結しません。
-- 文字起こし中の具体的な数値・金額・割合・固有名詞は、カードにそのまま
-  残します。これらは最も価値の高い情報です。省略・丸め・捏造は禁止です。
-- 1カードにつき主コンポーネントは1つ。結論や注意点のための callout を
-  最大1つまで追加できます。同種のコンポーネントを2つ重ねてはいけません。
-
-簡潔なタイトルとカードの内側のHTMLのみを返します。使用可能なタグは div,
-span, p, ul, ol, li, table, thead, tbody, tr, th, td, h3, h4, strong, em
-です。使用可能なクラスは card-body, flow, flow-step, flow-arrow, compare,
-compare-item, tree, tree-branch, timeline, timeline-item, keyvalue,
-keyvalue-item, key, value, callout, label, accent, muted です。html, style,
-script, インラインスタイル, イベントハンドラ, URL, 画像, その他のタグや
-クラスは決して出力しません。各カードは見出しと3〜7個の要素に収め、内部
-スクロールを発生させません。明らかな文字起こしミスは根拠のない事実を
-加えない範囲で自然に修正します。
-出力例:
-{json.dumps(FINAL_CARDS_JSON_EXAMPLE, ensure_ascii=False)}
-最終応答はJSONで返し、cards配列だけを含めます。
-"""
-
 CARD_SCHEMA = {
     "type": "object",
     "properties": {
@@ -224,28 +167,6 @@ CARD_SCHEMA = {
     ],
     "additionalProperties": False,
 }
-
-FINAL_CARD_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "cards": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "html": {"type": "string"},
-                    "source_text": {"type": "string"},
-                },
-                "required": ["title", "html", "source_text"],
-                "additionalProperties": False,
-            },
-        }
-    },
-    "required": ["cards"],
-    "additionalProperties": False,
-}
-
 
 class CardGenerationError(Exception):
     """OpenAI could not produce a valid diagram card."""
@@ -335,8 +256,16 @@ def reconcile_live_cards(
     for live_card in live_cards:
         ranked: list[tuple[int, int, Card]] = []
         for index, final_card in enumerate(final_cards):
+            live_parts = [live_card.title]
+            final_parts = [final_card.title]
+            if live_card.summary and final_card.summary:
+                live_parts.append(live_card.summary)
+                final_parts.append(final_card.summary)
+            if live_card.keywords and final_card.keywords:
+                live_parts.extend(live_card.keywords)
+                final_parts.extend(final_card.keywords)
             score = _reconciliation_score(
-                _card_search_text(live_card), _card_search_text(final_card)
+                " ".join(live_parts), " ".join(final_parts)
             )
             if score > 0:
                 ranked.append((score, index, final_card))
@@ -429,7 +358,8 @@ class _CardHTMLSanitizer(HTMLParser):
         self, tag: str, attrs: list[tuple[str, str | None]]
     ) -> None:
         if self.blocked_depth:
-            self.blocked_depth += 1
+            if tag in BLOCKED_CONTENT_TAGS:
+                self.blocked_depth += 1
             return
         if tag in BLOCKED_CONTENT_TAGS:
             self.blocked_depth = 1
@@ -460,7 +390,8 @@ class _CardHTMLSanitizer(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         if self.blocked_depth:
-            self.blocked_depth -= 1
+            if tag in BLOCKED_CONTENT_TAGS:
+                self.blocked_depth -= 1
             return
         if self.open_tags and self.open_tags[-1] == tag:
             self.open_tags.pop()
@@ -515,30 +446,6 @@ def card_generation_payload(
     }
 
 
-def final_card_generation_payload(
-    transcript: str,
-    model: ai.AIModel = ai.DEFAULT_AI_MODEL,
-) -> dict[str, Any]:
-    # ponytail: one full-transcript request; add chapter batching only if model
-    # limits are reached in real recordings.
-    return {
-        "model": model.model,
-        "reasoning": {"effort": "none"},
-        "instructions": FINAL_CARD_INSTRUCTIONS,
-        "input": transcript,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "final_diagram_cards",
-                "schema": FINAL_CARD_SCHEMA,
-                "strict": True,
-            }
-        },
-        "max_output_tokens": 16_384,
-        "store": False,
-    }
-
-
 def _response_output_text(
     response: dict[str, Any], model: ai.AIModel = ai.DEFAULT_AI_MODEL
 ) -> str:
@@ -576,7 +483,7 @@ def generate_card(
     topic_outline: list[str],
     model: ai.AIModel = ai.DEFAULT_AI_MODEL,
 ) -> dict[str, object]:
-    payload = _request_card_generation(
+    response = _request_card_generation(
         card_generation_payload(source_text, candidates, topic_outline, model),
         api_key,
         model,
@@ -584,7 +491,7 @@ def generate_card(
 
     try:
         result = json.loads(
-            ai.strip_code_fence(_response_output_text(payload, model))
+            ai.strip_code_fence(_response_output_text(response, model))
         )
         decision = result["decision"]
         card_ids = result["card_ids"]
@@ -623,7 +530,7 @@ def generate_card(
         sanitized_html = sanitize_card_html(raw_html)
         if not title or not sanitized_html or not summary or not keywords:
             raise CardGenerationError("図解生成のタイトルまたはHTMLが空です。")
-    total_tokens = (payload.get("usage") or {}).get("total_tokens")
+    total_tokens = (response.get("usage") or {}).get("total_tokens")
     return {
         "decision": decision,
         "card_ids": card_ids,
@@ -633,49 +540,6 @@ def generate_card(
         "keywords": keywords,
         "total_tokens": total_tokens,
     }
-
-
-def generate_final_cards(
-    transcript: str,
-    api_key: str,
-    model: ai.AIModel = ai.DEFAULT_AI_MODEL,
-) -> list[Card]:
-    payload = _request_card_generation(
-        final_card_generation_payload(transcript, model), api_key, model
-    )
-    try:
-        result = json.loads(
-            ai.strip_code_fence(_response_output_text(payload, model))
-        )
-        raw_cards = result["cards"]
-    except (KeyError, TypeError, json.JSONDecodeError) as error:
-        raise CardGenerationError("final図解生成の応答形式が不正です。") from error
-    if not isinstance(raw_cards, list) or not raw_cards:
-        raise CardGenerationError("final図解生成のカードが空です。")
-
-    generated: list[Card] = []
-    for raw_card in raw_cards:
-        if not isinstance(raw_card, dict) or not all(
-            isinstance(raw_card.get(key), str)
-            for key in ("title", "html", "source_text")
-        ):
-            raise CardGenerationError("final図解生成のカード形式が不正です。")
-        title = raw_card["title"].strip()
-        source_text = raw_card["source_text"].strip()
-        card_html = sanitize_card_html(raw_card["html"])
-        if not title or not card_html or not source_text:
-            raise CardGenerationError("final図解生成のカードに空の項目があります。")
-        generated.append(
-            Card(
-                id=uuid.uuid4().hex,
-                title=title,
-                html=card_html,
-                source_text=source_text,
-                created_at=time.time(),
-                status="done",
-            )
-        )
-    return generated
 
 
 def save_cards(cards: list[Card], output_path: Path) -> None:
@@ -716,10 +580,27 @@ class CardStore:
         store.json_path = json_path
         store.html_path = html_path
         if json_path.exists():
-            store.cards = [
-                Card(**value)
-                for value in json.loads(json_path.read_text(encoding="utf-8"))
-            ]
+            known_fields = {card_field.name for card_field in fields(Card)}
+            store.cards = []
+            for value in json.loads(json_path.read_text(encoding="utf-8")):
+                if not isinstance(value, dict):
+                    raise ValueError("カードJSONの形式が不正です。")
+                dropped = sorted(set(value) - known_fields)
+                if dropped:
+                    print(
+                        "警告: 未知のカード項目を読み飛ばしました: "
+                        + ", ".join(dropped),
+                        file=sys.stderr,
+                    )
+                store.cards.append(
+                    Card(
+                        **{
+                            key: item
+                            for key, item in value.items()
+                            if key in known_fields
+                        }
+                    )
+                )
         else:
             store.cards = []
             store._persist()
@@ -874,7 +755,22 @@ class CardPipeline:
             decision = str(result["decision"])
             if decision == "skip":
                 return
-            self._store_decision(source_text, decision, result)
+            try:
+                self._store_decision(source_text, decision, result)
+            except (
+                CardGenerationError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as error:
+                self.errors.append(str(error))
+                print(
+                    f"[cards] error: {time.perf_counter() - started:.1f}s, "
+                    "tokens unknown",
+                    flush=True,
+                )
+                print(f"[cards] 警告: {error}", file=sys.stderr, flush=True)
+                return
             token_log = "tokens unknown"
             if "total_tokens" in result and result["total_tokens"] is not None:
                 token_log = f"{result['total_tokens']} tokens"

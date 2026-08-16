@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import wave
 from pathlib import Path
@@ -112,7 +113,9 @@ def test_snapshot_recording_compatibility() -> None:
         appender = WavAppender(path)
         appender.open()
         appender.write(pcm)
-        snapshot = transcribe.snapshot_recording(appender, appender, path)
+        snapshot = asyncio.run(
+            transcribe.snapshot_recording(appender, appender, path)
+        )
         try:
             with wave.open(str(snapshot), "rb") as recording:
                 assert recording.getnframes() == 2

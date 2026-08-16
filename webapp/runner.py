@@ -6,6 +6,7 @@ import asyncio
 import base64
 import inspect
 import json
+import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from datetime import datetime
@@ -23,6 +24,9 @@ from websockets.exceptions import WebSocketException
 from webapp.store import Session, SessionStore
 from webapp.titles import generate_title
 from webapp.wav import WavAppender
+
+
+AUDIO_QUEUE_MAX_CHUNKS = 1_800
 
 
 class RunnerBusyError(RuntimeError):
@@ -61,6 +65,7 @@ class _EventEmitter:
         await self._emit(
             {
                 "type": "status",
+                "session_id": self.session.id,
                 "active_session_id": active_session_id,
                 "state": state,
             }
@@ -295,6 +300,7 @@ async def run_finalizer(
         result = broadcast(
             {
                 "type": "status",
+                "session_id": id,
                 "active_session_id": active,
                 "state": state,
             }
@@ -358,10 +364,12 @@ class SessionRunner(_EventEmitter):
         self.broadcast = broadcast or (lambda _: None)
 
         self.appender = WavAppender(self._path("audio"))
-        self.reducer = transcribe.TranscriptReducer(lambda _: None)
+        self.reducer = transcribe.TranscriptReducer()
         self.progress_changed = asyncio.Event()
         self.glossary: list[str] = []
-        self.audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self.audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(
+            maxsize=AUDIO_QUEUE_MAX_CHUNKS
+        )
         self.correction_queue: asyncio.Queue[tuple[int, str] | None] = (
             asyncio.Queue()
         )
@@ -374,6 +382,7 @@ class SessionRunner(_EventEmitter):
         self._receiver_task: asyncio.Task[None] | None = None
         self._correction_task: asyncio.Task[None] | None = None
         self._watch_task: asyncio.Task[None] | None = None
+        self._stop_task: asyncio.Task[None] | None = None
         self._background_tasks: list[asyncio.Task[None]] = []
         self._partial_tasks: list[asyncio.Task[None]] = []
         self._stop_lock = asyncio.Lock()
@@ -396,11 +405,13 @@ class SessionRunner(_EventEmitter):
         source_text: str,
         _: str,
         candidates: list[dict[str, object]],
-        glossary: list[str],
+        topic_outline: list[str],
         __: ai.AIModel,
     ) -> dict[str, object]:
         key, model = self._ai_credentials()
-        return self.card_generator(source_text, key, candidates, glossary, model)
+        return self.card_generator(
+            source_text, key, candidates, topic_outline, model
+        )
 
     def _extract_glossary(
         self, text: str, _: str, __: ai.AIModel
@@ -494,7 +505,14 @@ class SessionRunner(_EventEmitter):
     def feed_audio(self, pcm: bytes) -> bool:
         if not self._accepting_audio or not pcm:
             return False
-        self.audio_queue.put_nowait(pcm)
+        try:
+            self.audio_queue.put_nowait(pcm)
+        except asyncio.QueueFull:
+            print(
+                "警告: 音声処理が追いつかないため、音声チャンクを破棄しました。",
+                file=sys.stderr,
+            )
+            return False
         return True
 
     async def stop(self, *, finalize: bool = True) -> None:
@@ -507,118 +525,166 @@ class SessionRunner(_EventEmitter):
             self._accepting_audio = False
             await self._emit_status("stopping")
             expected_commits = self.reducer.commits_received + 1
+            finalizer_start = asyncio.Event()
+            try:
+                watch_task = self._watch_task
+                if (
+                    watch_task is not None
+                    and watch_task is not asyncio.current_task()
+                ):
+                    watch_task.cancel()
+                    await asyncio.gather(watch_task, return_exceptions=True)
 
-            self.audio_queue.put_nowait(None)
-            if self._uplink_task is not None:
+                if (
+                    self._uplink_task is not None
+                    and not self._uplink_task.done()
+                ):
+                    await self.audio_queue.put(None)
+                if self._uplink_task is not None:
+                    try:
+                        await self._uplink_task
+                    except (
+                        WebSocketException,
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                        transcribe.TranscriptionError,
+                    ) as error:
+                        await self._emit_error(error, fatal=True)
+
+                if (
+                    self._has_audio
+                    and self._receiver_task is not None
+                    and not self._receiver_task.done()
+                ):
+                    try:
+                        await asyncio.wait_for(
+                            transcribe.wait_for_committed_transcripts(
+                                self.reducer,
+                                self.progress_changed,
+                                expected_commits,
+                            ),
+                            timeout=transcribe.FINAL_WAIT_SECONDS,
+                        )
+                    except TimeoutError:
+                        pass
+
+                if (
+                    self._receiver_task is not None
+                    and not self._receiver_task.done()
+                ):
+                    self._receiver_task.cancel()
+                if self._receiver_task is not None:
+                    await asyncio.gather(
+                        self._receiver_task, return_exceptions=True
+                    )
+                await self._close_websocket()
+
+                await self.correction_queue.join()
+                self.correction_queue.put_nowait(None)
+                if self._correction_task is not None:
+                    await self._correction_task
+                if self._partial_tasks:
+                    await asyncio.gather(
+                        *self._partial_tasks, return_exceptions=True
+                    )
+
+                self.refresh_stop.set()
+                await asyncio.gather(
+                    *self._background_tasks, return_exceptions=True
+                )
                 try:
-                    await self._uplink_task
+                    self.appender.close()
+                except (OSError, ValueError) as error:
+                    print(
+                        f"警告: 録音ファイルを閉じられませんでした: {error}",
+                        file=sys.stderr,
+                    )
+                if self._transcript_file is not None:
+                    try:
+                        self._transcript_file.close()
+                    except OSError as error:
+                        print(
+                            "警告: 文字起こしファイルを閉じられませんでした: "
+                            f"{error}",
+                            file=sys.stderr,
+                        )
+                    self._transcript_file = None
+                self.session.duration_seconds = (
+                    self.appender.tell() / transcribe.SAMPLE_RATE
+                )
+                self.session.updated_at = _now()
+                try:
+                    self._save_session()
+                except OSError as error:
+                    print(
+                        f"警告: セッション情報を保存できませんでした: {error}",
+                        file=sys.stderr,
+                    )
+
+                try:
+                    assert self.pipeline is not None
+                    await self.pipeline.close(generate_pending=finalize)
+                    self.session.processing_warnings.extend(
+                        warning
+                        for warning in self.pipeline.errors
+                        if warning not in self.session.processing_warnings
+                    )
+                    await self._broadcast_cards_if_changed(force=True)
                 except (
-                    WebSocketException,
+                    cards.CardGenerationError,
                     OSError,
                     RuntimeError,
                     ValueError,
-                    transcribe.TranscriptionError,
                 ) as error:
-                    await self._emit_error(error, fatal=True)
+                    await self._emit_error(error, fatal=False)
 
-            if (
-                self._has_audio
-                and self._receiver_task is not None
-                and not self._receiver_task.done()
-            ):
+                self.session.state = "stopped"
+                self.session.updated_at = _now()
                 try:
-                    await asyncio.wait_for(
-                        transcribe.wait_for_committed_transcripts(
-                            self.reducer,
-                            self.progress_changed,
-                            expected_commits,
-                        ),
-                        timeout=transcribe.FINAL_WAIT_SECONDS,
+                    self._save_session()
+                except OSError as error:
+                    print(
+                        f"警告: セッション情報を保存できませんでした: {error}",
+                        file=sys.stderr,
                     )
-                except TimeoutError:
-                    pass
 
-            if self._receiver_task is not None and not self._receiver_task.done():
-                self._receiver_task.cancel()
-            if self._receiver_task is not None:
-                await asyncio.gather(self._receiver_task, return_exceptions=True)
-            await self._close_websocket()
+                if finalize:
+                    finalizer = SessionFinalizer(
+                        self.session,
+                        self.store,
+                        self.root,
+                        elevenlabs_key=self.elevenlabs_key,
+                        openai_key=self.openai_key,
+                        deepseek_key=self.deepseek_key,
+                        curl_path=self.curl_path,
+                        broadcast=self.broadcast,
+                        batch_words_fn=self.batch_words_fn,
+                        final_compiler=self.final_compiler,
+                        final_renderer=self.final_renderer,
+                        title_fn=self.title_fn,
+                    )
+                    task = asyncio.create_task(
+                        run_finalizer(
+                            finalizer_start,
+                            self.registry,
+                            self.session.id,
+                            finalizer,
+                            self.broadcast,
+                        )
+                    )
+                    self.registry.finalizing[self.session.id] = task
 
-            await self.correction_queue.join()
-            self.correction_queue.put_nowait(None)
-            if self._correction_task is not None:
-                await self._correction_task
-            if self._partial_tasks:
-                await asyncio.gather(*self._partial_tasks, return_exceptions=True)
-
-            self.refresh_stop.set()
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
-            self.appender.close()
-            if self._transcript_file is not None:
-                self._transcript_file.close()
-                self._transcript_file = None
-            self.session.duration_seconds = self.appender.tell() / transcribe.SAMPLE_RATE
-            self.session.updated_at = _now()
-            self._save_session()
-
-            try:
-                assert self.pipeline is not None
-                await self.pipeline.close(generate_pending=finalize)
-                self.session.processing_warnings.extend(
-                    warning
-                    for warning in self.pipeline.errors
-                    if warning not in self.session.processing_warnings
-                )
-                await self._broadcast_cards_if_changed(force=True)
-            except (
-                cards.CardGenerationError,
-                OSError,
-                RuntimeError,
-                ValueError,
-            ) as error:
-                await self._emit_error(error, fatal=False)
-
-            self.session.state = "stopped"
-            self.session.updated_at = _now()
-            try:
-                self._save_session()
+                await self._emit_session()
             finally:
+                self.session.state = "stopped"
                 self.registry.release()
                 self._started = False
                 self._stopped = True
-
-            finalizer_start = asyncio.Event()
-            if finalize:
-                finalizer = SessionFinalizer(
-                    self.session,
-                    self.store,
-                    self.root,
-                    elevenlabs_key=self.elevenlabs_key,
-                    openai_key=self.openai_key,
-                    deepseek_key=self.deepseek_key,
-                    curl_path=self.curl_path,
-                    broadcast=self.broadcast,
-                    batch_words_fn=self.batch_words_fn,
-                    final_compiler=self.final_compiler,
-                    final_renderer=self.final_renderer,
-                    title_fn=self.title_fn,
-                )
-                task = asyncio.create_task(
-                    run_finalizer(
-                        finalizer_start,
-                        self.registry,
-                        self.session.id,
-                        finalizer,
-                        self.broadcast,
-                    )
-                )
-                self.registry.finalizing[self.session.id] = task
-
-            try:
-                await self._emit_session()
-                await self._emit_status("idle")
-            finally:
-                finalizer_start.set()
+                try:
+                    await self._emit_status("idle")
+                finally:
+                    finalizer_start.set()
 
     async def _uplink(self) -> None:
         buffer = bytearray()
@@ -660,6 +726,16 @@ class SessionRunner(_EventEmitter):
         )
 
     def _on_partial(self, text: str) -> None:
+        completed = [task for task in self._partial_tasks if task.done()]
+        for task in completed:
+            if not task.cancelled() and task.exception() is not None:
+                print(
+                    f"警告: 途中経過の通知に失敗しました: {task.exception()}",
+                    file=sys.stderr,
+                )
+        self._partial_tasks = [
+            task for task in self._partial_tasks if not task.done()
+        ]
         task = asyncio.create_task(self._emit({"type": "partial", "text": text}))
         self._partial_tasks.append(task)
 
@@ -708,7 +784,11 @@ class SessionRunner(_EventEmitter):
                     transcribe.TranscriptionError,
                 ) as error:
                     await self._emit_error(error, fatal=True)
-                    asyncio.create_task(self.stop())
+                    if self._stop_task is None:
+                        self._stop_task = asyncio.create_task(self.stop())
+                        self._stop_task.add_done_callback(
+                            self._log_stop_failure
+                        )
                 else:
                     context = "\n".join(filter(None, (context, corrected)))[-500:]
             finally:
@@ -848,6 +928,20 @@ class SessionRunner(_EventEmitter):
 
     async def _abort_start(self) -> None:
         self.refresh_stop.set()
+        tasks = [
+            task
+            for task in (
+                self._uplink_task,
+                self._receiver_task,
+                self._correction_task,
+                self._watch_task,
+                *self._background_tasks,
+            )
+            if task is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         if self.pipeline is not None:
             try:
                 await self.pipeline.close()
@@ -875,6 +969,13 @@ class SessionRunner(_EventEmitter):
         if self.registry is not None:
             self.registry.release()
         self._stopped = True
+
+    def _log_stop_failure(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            print(f"警告: 停止処理に失敗しました: {error}", file=sys.stderr)
 
     def _save_session(self) -> None:
         _save_session_to_store(self.store, self.session)

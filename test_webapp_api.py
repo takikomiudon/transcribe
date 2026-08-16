@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import tempfile
@@ -15,6 +16,8 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from webapp.app import app
+from webapp.config import ensure_dirs
+from webapp.store import SessionStore
 from webapp.wav import WavAppender
 
 
@@ -286,6 +289,17 @@ def test_patch_rename_and_reject_blank_title() -> None:
             )
 
 
+def test_manifest_mutation_routes_run_on_event_loop() -> None:
+    endpoints = {
+        route.name: route.endpoint
+        for route in app.routes
+        if hasattr(route, "endpoint")
+    }
+
+    for name in ("rename_session", "select_model", "delete_session"):
+        assert inspect.iscoroutinefunction(endpoints[name])
+
+
 def test_unknown_session_returns_404() -> None:
     with api_client() as (client, _):
         id = "20260101-000000"
@@ -372,6 +386,24 @@ def test_finalize_session_rejects_recording_missing_audio_and_duplicate() -> Non
             )
         finally:
             app.state.finalizing.pop(duplicate_id)
+
+
+def test_finalize_session_rejects_unconfigured_saved_provider() -> None:
+    with api_client() as (client, root):
+        id = client.post("/api/sessions").json()["id"]
+        session = app.state.store.get(id)
+        assert session is not None
+        session.ai_provider = "deepseek"
+        session.ai_model = "deepseek-v4-flash"
+        session.has_audio = True
+        app.state.store.save(session)
+        (root / session.paths["audio"]).write_bytes(b"audio")
+
+        with patch("ai.is_deepseek_peak_hour", return_value=False):
+            response = client.post(f"/api/sessions/{id}/finalize")
+
+        assert response.status_code == 409
+        assert "再処理を開始できません" in response.json()["detail"]
 
 
 def test_delete_removes_manifest_and_related_files() -> None:
@@ -499,6 +531,50 @@ def test_export_returns_self_contained_html() -> None:
         assert "Export title" in response.text
         assert "Export topic" in response.text
         assert "showTopic" in response.text
+
+
+def test_detail_and_export_degrade_corrupt_json_to_empty(capsys) -> None:
+    with api_client() as (client, root):
+        id = client.post("/api/sessions").json()["id"]
+        (root / f"cards_output/{id}.json").write_text(
+            "{truncated", encoding="utf-8"
+        )
+
+        detail = client.get(f"/api/sessions/{id}")
+        exported = client.get(f"/api/sessions/{id}/export")
+
+        assert detail.status_code == 200
+        assert detail.json()["cards"] == []
+        assert exported.status_code == 200
+        assert "空として扱います" in capsys.readouterr().err
+
+
+def test_server_boots_and_lists_healthy_sessions_with_corrupt_manifest(
+    capsys,
+) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        ensure_dirs(root)
+        healthy = SessionStore(root).create()
+        (root / "sessions/20260101-000000.json").write_text(
+            "{garbage", encoding="utf-8"
+        )
+        environment = {
+            "TRANSCRIBE_WEBAPP_ROOT": str(root),
+            "ELEVENLABS_API_KEY": "test-elevenlabs-key",
+            "OPENAI_API_KEY": "test-openai-key",
+        }
+
+        with patch.dict(os.environ, environment), TestClient(app) as client:
+            response = client.get("/api/sessions")
+
+        assert response.status_code == 200
+        assert [session["id"] for session in response.json()["sessions"]] == [
+            healthy.id
+        ]
+        assert "セッション情報を読み込めないためスキップします" in (
+            capsys.readouterr().err
+        )
 
 
 def test_lifespan_rejects_missing_api_keys_and_curl() -> None:

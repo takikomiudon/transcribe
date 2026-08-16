@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -245,3 +246,17 @@ def test_segment_json_roundtrip_and_source_reconstruction() -> None:
     assert evidence.reconstruct_source_text(
         ["seg-0001", "seg-0002"], loaded
     ) == "根拠その一。\n\n根拠その二。"
+
+
+def test_save_segments_removes_temporary_file_after_failure() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "session-segments.json"
+        temporary = path.with_suffix(".json.tmp")
+
+        with (
+            patch.object(Path, "replace", side_effect=OSError("disk full")),
+            pytest.raises(OSError, match="disk full"),
+        ):
+            evidence.save_segments(path, "session", [])
+
+        assert not temporary.exists()

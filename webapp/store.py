@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import wave
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -98,7 +99,26 @@ class SessionStore:
         self.directory.mkdir(parents=True, exist_ok=True)
 
     def list(self) -> list[Session]:
-        sessions = [self._read(path) for path in self.directory.glob("*.json")]
+        sessions: list[Session] = []
+        for path in self.directory.glob("*.json"):
+            try:
+                session = self._read(path)
+                datetime.fromisoformat(session.created_at)
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as error:
+                print(
+                    "警告: セッション情報を読み込めないためスキップします "
+                    f"({path.name}): {error}",
+                    file=sys.stderr,
+                )
+                continue
+            sessions.append(session)
         return sorted(
             sessions,
             key=lambda session: (

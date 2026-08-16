@@ -62,7 +62,10 @@ let headerRenameActive = false;
 let reconnectAttempt = 0;
 let reconnectTimer = null;
 let recordingInterrupted = false;
+let renderedTranscriptSignature = "";
+let activeSessionId = "";
 const cardVersions = new Map();
+const finalizingSessionIds = new Set();
 const cardTabs = [elements.liveCardsTab, elements.finalCardsTab];
 const primaryTabs = [...document.querySelectorAll(".knowledge-tab")];
 const primaryPanels = [...document.querySelectorAll(".knowledge-panel, .transcript-panel, .cards-panel")];
@@ -181,6 +184,9 @@ async function initialize() {
     ]);
     state.sessions = sortSessions(sessionsPayload.sessions);
     state.status = statusPayload;
+    if (typeof statusPayload.active_session_id === "string") {
+      activeSessionId = statusPayload.active_session_id;
+    }
     state.models = configPayload.models;
     state.defaultModel = configPayload.default_model;
     state.deepseekPeakHoursUtc = configPayload.deepseek_peak_hours_utc;
@@ -274,6 +280,9 @@ async function createSession() {
 }
 
 async function selectSession(id) {
+  if (state.recorder && state.currentId !== id) {
+    if (!confirm("録音を停止して別のセッションへ移動しますか？")) return;
+  }
   const version = ++selectionVersion;
   if (state.recorder) await stopLocalRecorder();
   closeSocket(true);
@@ -325,13 +334,17 @@ function openSocket(id, reconnecting = false) {
   });
   socket.addEventListener("message", async event => {
     if (state.ws !== socket) return;
+    let payload;
     try {
-      await handleServerEvent(JSON.parse(event.data));
+      payload = JSON.parse(event.data);
     } catch (serverMessageError) {
-      if (!(serverMessageError instanceof SyntaxError || serverMessageError instanceof TypeError)) {
-        throw serverMessageError;
-      }
       showToast("サーバーから不正なメッセージを受信しました。");
+      return;
+    }
+    try {
+      await handleServerEvent(payload);
+    } catch (serverEventError) {
+      console.error("サーバーメッセージの処理に失敗しました。", serverEventError);
     }
   });
   socket.addEventListener("close", async event => {
@@ -343,7 +356,8 @@ function openSocket(id, reconnecting = false) {
     await stopLocalRecorder();
     if (wasRecording) {
       recordingInterrupted = true;
-      state.status = {active_session_id: null, state: "idle"};
+      activeSessionId = "";
+      state.status = {session_id: id, active_session_id: null, state: "idle"};
       if (currentDetail) {
         currentDetail.session.state = "stopped";
         upsertSession(currentDetail.session);
@@ -399,6 +413,7 @@ function applySessionDetail(detail) {
   knowledgeUnits = detail.knowledge;
   finalReady = finalCards.length > 0 || detail.session.finalized;
   transcriptMode = "live";
+  renderedTranscriptSignature = "";
   renderAll();
   updateCardTabs();
   selectCardView(finalReady ? "final" : "live");
@@ -406,22 +421,46 @@ function applySessionDetail(detail) {
 
 async function handleServerEvent(event) {
   switch (event.type) {
-    case "status":
+    case "status": {
+      let subjectId = "";
+      if (typeof event.session_id === "string") subjectId = event.session_id;
+      const finalizationCompleted = Boolean(
+        subjectId
+        && finalizingSessionIds.has(subjectId)
+        && event.state !== "finalizing",
+      );
+      if (subjectId && event.state === "finalizing") {
+        finalizingSessionIds.add(subjectId);
+      } else if (finalizationCompleted) {
+        finalizingSessionIds.delete(subjectId);
+      }
+      if (typeof event.active_session_id === "string") {
+        activeSessionId = event.active_session_id;
+      } else if (event.state === "idle" && subjectId === activeSessionId) {
+        activeSessionId = "";
+      }
       if (recordingInterrupted && event.active_session_id === state.currentId && event.state === "recording") {
-        state.status = {active_session_id: null, state: "idle"};
+        activeSessionId = "";
+        state.status = {session_id: subjectId, active_session_id: null, state: "idle"};
       } else {
         state.status = event;
       }
-      if (event.state === "idle") recordingInterrupted = false;
+      if (event.state === "idle" && subjectId === state.currentId) recordingInterrupted = false;
       if (event.state === "recording" && event.active_session_id === state.currentId && startRequested && !state.recorder) {
         await startLocalRecorder();
       }
-      if (["stopping", "finalizing", "idle"].includes(event.state)) {
+      if (subjectId === state.currentId && ["stopping", "finalizing", "idle"].includes(event.state)) {
         await stopLocalRecorder();
         if (event.state === "idle") startRequested = false;
       }
       renderAll();
+      if (finalizationCompleted && subjectId !== state.currentId) {
+        const sessionsPayload = await request("/api/sessions");
+        state.sessions = sortSessions(sessionsPayload.sessions);
+        renderSidebar();
+      }
       break;
+    }
     case "session":
       if (recordingInterrupted && event.session.state === "recording") {
         event.session.state = "stopped";
@@ -447,6 +486,7 @@ async function handleServerEvent(event) {
         if (event.segments) currentDetail.segments = event.segments;
       }
       if (event.segments) evidenceSegments = event.segments;
+      renderedTranscriptSignature = "";
       elements.finalTranscriptButton.disabled = false;
       if (transcriptMode === "final") renderTranscript();
       break;
@@ -497,7 +537,8 @@ async function handleRecordButton() {
     state.ws.send(JSON.stringify({type: "start", sample_rate: 16000}));
   } else if (action === "stop") {
     await stopLocalRecorder();
-    state.status = {active_session_id: state.currentId, state: "stopping"};
+    activeSessionId = state.currentId;
+    state.status = {session_id: state.currentId, active_session_id: state.currentId, state: "stopping"};
     renderHeader();
     state.ws.send(JSON.stringify({type: "stop"}));
   }
@@ -632,7 +673,10 @@ function sessionButton(session) {
   reprocess.className = "session-menu-action";
   reprocess.setAttribute("role", "menuitem");
   reprocess.textContent = "再処理";
-  reprocess.disabled = !session.has_audio || session.state === "recording" || state.status.active_session_id === session.id;
+  const finalizing = finalizingSessionIds.has(session.id);
+  const stopping = state.status.session_id === session.id && state.status.state === "stopping";
+  if (finalizing) reprocess.textContent = "再処理中…";
+  reprocess.disabled = !session.has_audio || session.state === "recording" || activeSessionId === session.id || finalizing || stopping;
   if (reprocess.disabled) reprocess.title = "停止済みの録音を再処理できます";
   reprocess.addEventListener("click", () => reprocessSession(session, reprocess));
 
@@ -641,7 +685,7 @@ function sessionButton(session) {
   remove.className = "session-menu-action danger-text";
   remove.setAttribute("role", "menuitem");
   remove.textContent = "削除";
-  remove.disabled = session.state === "recording" || state.status.active_session_id === session.id;
+  remove.disabled = session.state === "recording" || activeSessionId === session.id || finalizing || stopping;
   if (remove.disabled) remove.title = "録音中のセッションは削除できません";
   remove.addEventListener("click", () => deleteSession(session));
 
@@ -750,7 +794,11 @@ async function changeModel() {
 async function deleteSession(session) {
   closeSessionMenus();
   const title = session.title || stemTitle(session.id);
-  if (!confirm(`「${title}」を削除しますか？`)) return;
+  let message = `「${title}」を削除しますか？`;
+  if (state.recorder && session.id === state.currentId) {
+    message = `録音を停止して「${title}」を削除しますか？`;
+  }
+  if (!confirm(message)) return;
   try {
     await request(`/api/sessions/${encodeURIComponent(session.id)}`, {method: "DELETE"});
     state.sessions = state.sessions.filter(item => item.id !== session.id);
@@ -838,10 +886,11 @@ function renderHeader() {
   elements.sessionTitle.textContent = session.title || stemTitle(session.id);
   elements.sessionTitleButton.disabled = false;
   elements.sessionMeta.textContent = `${formatDateTime(session.created_at)}${session.duration_seconds === null ? "" : ` · ${formatDuration(session.duration_seconds)}`}`;
-  const activeId = state.status.active_session_id;
+  const activeId = activeSessionId;
   const activeHere = activeId === session.id;
-  const finalizing = activeHere && ["stopping", "finalizing"].includes(state.status.state);
-  const recording = activeHere && state.status.state === "recording";
+  const statusHere = state.status.session_id === session.id;
+  const finalizing = finalizingSessionIds.has(session.id) || (statusHere && state.status.state === "stopping");
+  const recording = activeHere && !finalizing;
   renderModelSelector(session, recording, finalizing);
 
   elements.statusBadge.className = "status-badge stopped";
@@ -926,13 +975,37 @@ function renderAudio() {
     elements.audioPlayer.removeAttribute("src");
     return;
   }
-  const source = `/api/sessions/${encodeURIComponent(session.id)}/audio`;
+  let version = "recording";
+  if (session.state !== "recording") {
+    version = `${session.finalized}-${session.duration_seconds}`;
+  }
+  const source = `/api/sessions/${encodeURIComponent(session.id)}/audio?v=${encodeURIComponent(version)}`;
   if (elements.audioPlayer.getAttribute("src") !== source) {
     elements.audioPlayer.src = source;
   }
 }
 
 function renderTranscript() {
+  let itemCount = transcriptItems.length;
+  let lastId = "";
+  let lastText = "";
+  if (transcriptMode === "final" && evidenceSegments.length) {
+    itemCount = evidenceSegments.length;
+    const last = evidenceSegments[evidenceSegments.length - 1];
+    lastId = last.id;
+    lastText = `${last.raw_text}:${last.normalized_text}`;
+  } else if (transcriptMode === "final" && currentDetail) {
+    const paragraphs = splitParagraphs(currentDetail.final_transcript || "");
+    itemCount = paragraphs.length;
+    if (paragraphs.length) lastText = paragraphs[paragraphs.length - 1];
+  } else if (transcriptItems.length) {
+    const last = transcriptItems[transcriptItems.length - 1];
+    lastId = String(last.seq);
+    lastText = last.text;
+  }
+  const signature = `${state.currentId}:${transcriptMode}:${itemCount}:${lastId}:${lastText}`;
+  if (signature === renderedTranscriptSignature) return;
+  renderedTranscriptSignature = signature;
   const atBottom = nearBottom(elements.transcriptScroll);
   elements.transcriptContent.textContent = "";
   if (!currentDetail) {
@@ -1076,6 +1149,7 @@ function cardElement(card) {
 
   const content = document.createElement("div");
   content.className = "card-content";
+  // card.html の唯一のXSS防御はサーバー側の cards.sanitize_card_html です。
   content.innerHTML = card.html;
 
   const details = document.createElement("details");

@@ -32,22 +32,27 @@ def _component(unit: KnowledgeUnit) -> str:
 
 def _render_component(unit: KnowledgeUnit, component: str) -> str:
     summary = html.escape(unit.summary)
+    summary_body = ""
+    if summary:
+        summary_body = f"<p>{summary}</p>"
+    if component in {"flow", "compare", "tree", "timeline"} and not unit.items:
+        return summary_body
     if component == "flow":
         children: list[str] = []
         for index, item in enumerate(unit.items):
             if index:
                 children.append('<span class="flow-arrow">→</span>')
             children.append(_item(item, "flow-step"))
-        return f'<div class="flow">{"".join(children)}</div>'
+        return summary_body + f'<div class="flow">{"".join(children)}</div>'
     if component == "compare":
         children = "".join(_item(item, "compare-item") for item in unit.items)
-        return f'<div class="compare">{children}</div>'
+        return summary_body + f'<div class="compare">{children}</div>'
     if component == "tree":
         children = "".join(_item(item, "tree-branch") for item in unit.items)
-        return f'<div class="tree">{children}</div>'
+        return summary_body + f'<div class="tree">{children}</div>'
     if component == "timeline":
         children = "".join(_item(item, "timeline-item") for item in unit.items)
-        return f'<div class="timeline">{children}</div>'
+        return summary_body + f'<div class="timeline">{children}</div>'
     if component == "keyvalue":
         children = "".join(
             '<div class="keyvalue-item">'
@@ -145,6 +150,7 @@ def render_cards(
                 unit_ids=[card_unit.id for card_unit in card_units],
                 evidence_segment_ids=evidence_ids,
                 component=component,
+                summary=unit.summary,
             )
         )
     return rendered
